@@ -1,0 +1,17 @@
+[project]
+name = "bybit-scalper"
+version = "0.1.0"
+description = "Скальпинг-бот USDT-perpetual Bybit (pybit 5.17.0). По умолчанию paper/offline."
+requires-python = ">=3.10"
+dependencies = [
+  "pybit==5.17.0",
+  "PyYAML==6.0.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
