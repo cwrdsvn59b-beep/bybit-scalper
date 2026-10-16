@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from copy import deepcopy
 from collections import deque
 from datetime import datetime, timezone
@@ -408,6 +409,19 @@ class Engine:
                 return
         self.signal_count += 1
         self.audit.append((bar_ts, "signal"))
+        if self.cfg.mode in {"testnet", "live"}:
+            preflight_started = time.monotonic()
+            try:
+                self.apply_account(self.exchange.read_account())
+            except Exception:
+                self.margin_verified = False
+                return
+            budget = self._budget()
+            if budget is None:
+                return
+            after_preflight = market.now_ms + int((time.monotonic() - preflight_started) * 1000)
+            if after_preflight - market.book.ts > self.cfg.stale_book_ms or not self._funding_allows(after_preflight):
+                return
         plan = build_plan(
             decision.signal,
             market.book.bid,
@@ -696,7 +710,7 @@ class Engine:
     def _funding_allows(self, now_ms: int) -> bool:
         if self.cfg.mode == "offline":
             return True
-        if self.next_funding_ms <= 0:
+        if self.next_funding_ms <= now_ms:
             return False
         crosses = funding_crosses(now_ms, self.cfg.max_hold_sec * 1000, self.next_funding_ms)
         if crosses and not self.funding_ledger_confirmed:
@@ -712,7 +726,8 @@ class Engine:
         notional = plan.entry * plan.qty
         reserve = self.cfg.d("slippage_bps") + self.cfg.d("adverse_reserve_bps")
         need = notional / leverage + notional * (self.fees.taker * 2 + reserve / D("10000"))
-        return need <= self.available
+        budget = self._budget()
+        return budget is not None and need <= min(self.available, budget)
 
     def apply_account(self, view) -> None:
         self.verified_equity = view.equity

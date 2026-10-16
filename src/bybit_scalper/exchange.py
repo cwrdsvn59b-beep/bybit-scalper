@@ -267,6 +267,13 @@ class PybitBroker:
             raise RuntimeError("Не удалось подтвердить положительный капитал UNIFIED")
         return equity
 
+    def account_identity(self) -> str:
+        response = self._call("get_api_key_information")
+        uid = (response.get("result") or {}).get("userID")
+        if response.get("retCode", 0) != 0 or uid is None or not str(uid).isdigit() or int(uid) <= 0:
+            raise RuntimeError("Не подтверждён UID аккаунта для блокировки второго экземпляра")
+        return str(uid)
+
     def read_account(self) -> AccountView:
         """Read margin facts. Does not call set_leverage or switch margin/position mode."""
         bal = self._call("get_wallet_balance", accountType="UNIFIED")
@@ -285,87 +292,88 @@ class PybitBroker:
         leverage = D((chosen or {}).get("leverage") or "0")
         raw_mode = None if chosen is None else chosen.get("tradeMode")
         trade_mode = None if raw_mode is None or raw_mode == "" else int(raw_mode)
-        verified = True
-        label = {0: "cross", 1: "isolated"}.get(trade_mode, "unknown")
-        if margin_mode == "PORTFOLIO_MARGIN":
-            verified = False
-            label = "portfolio"
-        if trade_mode not in (0, 1):
+        label = {"REGULAR_MARGIN": "cross", "ISOLATED_MARGIN": "isolated",
+                 "PORTFOLIO_MARGIN": "portfolio"}.get(margin_mode, "unknown")
+        # totalEquity/totalAvailableBalance are not applicable in isolated mode.
+        # Until an isolated-margin reader is implemented, fail closed for that mode.
+        verified = margin_mode == "REGULAR_MARGIN"
+        if trade_mode != 0:
             verified = False
         if not (D("0") < leverage <= self.cfg.d("max_leverage")):
             verified = False
-        if equity <= 0:
+        if not equity.is_finite() or not available.is_finite() or equity <= 0 or available < 0:
             verified = False
         return AccountView(equity, available, label, leverage, verified)
 
     def sync_cashflows(self, store) -> bool:
-        """Load funding and transfers. False means the ledger is not confirmed, even after partial writes."""
+        """Fetch a complete interval first, then atomically publish the canonical ledger.
+
+        V5 transaction-log is authoritative. Mixing funding executions with settlement
+        records assumes undocumented ID correspondence and can double-charge funding.
+        """
         try:
-            self._paginate_funding_executions(store)
-            self._paginate_transaction_log(store)
+            end = self.server_time_ms()
+            if end <= 0:
+                raise ValueError("invalid server time")
+            checkpoint = int(store.get_kv("cashflow_synced_ms", "0") or "0")
+            if checkpoint > end:
+                raise ValueError("ledger checkpoint is ahead of server time")
+            day_start = end // 86_400_000 * 86_400_000
+            start = min(day_start, checkpoint or day_start) - 86_400_000
+            records = []
+            window_start = start
+            while window_start <= end:
+                window_end = min(end, window_start + 7 * 86_400_000 - 1)
+                for kind in ("SETTLEMENT", "TRANSFER_IN", "TRANSFER_OUT"):
+                    records.extend(self._paginate_transaction_log(window_start, window_end, kind))
+                window_start = window_end + 1
+            store.replace_cashflow_window(start, end + 1, records)
         except Exception:
-            log.warning("журнал funding не подтверждён")
+            log.warning("журнал funding не подтверждён; предыдущий снимок сохранён")
             return False
         return True
 
-    def _paginate_funding_executions(self, store) -> None:
-        from bybit_scalper.ledger import funding_from_execution
-
-        cursor = ""
-        seen: set[str] = set()
-        for _page in range(50):
-            params = dict(
-                category=self.cfg.category,
-                symbol=self.cfg.symbol,
-                limit=100,
-                execType="Funding",
-            )
-            if cursor:
-                params["cursor"] = cursor
-            resp = self._call("get_executions", **params)
-            payload = resp.get("result") or {}
-            for row in payload.get("list") or []:
-                if row.get("symbol") not in (None, "", self.cfg.symbol):
-                    continue
-                parsed = funding_from_execution(row)
-                if parsed is None:
-                    continue
-                exec_id, cash, ts, aliases = parsed
-                store.add_cashflow("execution", exec_id, "funding", cash, ts, aliases)
-            cursor = payload.get("nextPageCursor") or ""
-            if not cursor:
-                return
-            if cursor in seen:
-                raise RuntimeError("funding execution cursor repeated")
-            seen.add(cursor)
-        raise RuntimeError("funding execution pagination truncated")
-
-    def _paginate_transaction_log(self, store) -> None:
+    def _paginate_transaction_log(self, start_ms: int, end_ms: int, kind_filter: str) -> list[tuple]:
         from bybit_scalper.ledger import cashflow_from_transaction
 
         cursor = ""
         seen: set[str] = set()
+        records = []
         for _page in range(50):
-            params = dict(accountType="UNIFIED", category="linear", limit=50)
+            # Omit category: transfers can have no trading category.
+            params = dict(
+                accountType="UNIFIED",
+                currency="USDT",
+                limit=50,
+                startTime=start_ms,
+                endTime=end_ms,
+                type=kind_filter,
+            )
             if cursor:
                 params["cursor"] = cursor
             resp = self._call("get_transaction_log", **params)
-            payload = resp.get("result") or {}
-            for row in payload.get("list") or []:
-                currency = str(row.get("currency") or "")
-                if currency and currency != "USDT":
+            if resp.get("retCode", 0) != 0 or not isinstance(resp.get("result"), dict):
+                raise RuntimeError("invalid transaction-log response")
+            payload = resp["result"]
+            if not isinstance(payload.get("list"), list):
+                raise RuntimeError("transaction-log list missing")
+            for row in payload["list"]:
+                if row.get("type") != kind_filter:
+                    continue
+                if row.get("currency") != "USDT":
                     continue
                 parsed = cashflow_from_transaction(row)
                 if parsed is None:
                     continue
                 kind, external, cash, ts, aliases = parsed
-                symbol = str(row.get("symbol") or "")
-                if kind == "funding" and symbol and symbol != self.cfg.symbol:
+                if kind == "funding" and row.get("symbol") != self.cfg.symbol:
                     continue
-                store.add_cashflow("transaction", external, kind, cash, ts, aliases)
+                if not start_ms <= ts <= end_ms:
+                    raise RuntimeError("transaction outside requested interval")
+                records.append((kind, external, cash, ts, aliases))
             cursor = payload.get("nextPageCursor") or ""
             if not cursor:
-                return
+                return records
             if cursor in seen:
                 raise RuntimeError("transaction log cursor repeated")
             seen.add(cursor)

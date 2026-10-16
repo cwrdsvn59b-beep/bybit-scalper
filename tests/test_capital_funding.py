@@ -26,7 +26,8 @@ def test_funding_execution_and_settlement_are_stored_once(cfg, tmp_path):
         {
             "id": "tx-1",
             "type": "SETTLEMENT",
-            "cashFlow": "-1.25",
+            "cashFlow": "0",
+            "funding": "-1.25",
             "transactionTime": engine.now_ms,
             "tradeId": "exec-f",
         }
@@ -215,10 +216,10 @@ def test_account_reader_rejects_portfolio_and_unknown_margin(cfg):
     portfolio = broker.read_account()
     assert portfolio.verified is False
     assert portfolio.margin_mode == "portfolio"
-    broker._call = caller("REGULAR_MARGIN", 1)
+    broker._call = caller("REGULAR_MARGIN", 0)
     isolated = broker.read_account()
     assert isolated.verified is True
-    assert isolated.margin_mode == "isolated"
+    assert isolated.margin_mode == "cross"
     assert isolated.available == D("800")
     broker._call = caller("REGULAR_MARGIN", 3)
     assert broker.read_account().verified is False
@@ -228,6 +229,7 @@ def test_cashflow_sync_paginates_without_double_count_and_fails_closed(cfg, tmp_
     store = StateStore(str(tmp_path / "sync.db"))
     broker = object.__new__(PybitBroker)
     broker.cfg = cfg
+    broker.server_time_ms = lambda: 1700000101000
     state = {"exec": 0}
 
     def _call(method, **kwargs):
@@ -247,7 +249,8 @@ def test_cashflow_sync_paginates_without_double_count_and_fails_closed(cfg, tmp_
                 {
                     "id": "tx-1",
                     "type": "SETTLEMENT",
-                    "cashFlow": "-1.25",
+                    "cashFlow": "0",
+                    "funding": "-1.25",
                     "transactionTime": "1700000100000",
                     "tradeId": "exec-f",
                     "currency": "USDT",
@@ -276,9 +279,7 @@ def test_cashflow_sync_paginates_without_double_count_and_fails_closed(cfg, tmp_
     assert store.sum_cashflow("transfer_in", 0, 10**15) == D("50")
 
     def repeated(method, **_kwargs):
-        if method == "get_executions":
-            return {"result": {"list": [], "nextPageCursor": "same"}}
-        return {"result": {"list": [], "nextPageCursor": ""}}
+        return {"result": {"list": [], "nextPageCursor": "same"}}
 
     broker._call = repeated
     assert broker.sync_cashflows(store) is False

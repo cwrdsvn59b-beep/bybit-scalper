@@ -16,7 +16,7 @@ from bybit_scalper.decimals import D
 from bybit_scalper.engine import Engine
 from bybit_scalper.paper import PaperExchange
 from bybit_scalper.report import format_report, summarize
-from bybit_scalper.state import StateStore
+from bybit_scalper.state import StateStore, account_lease
 from bybit_scalper.synthetic import build_long_fixture, candles_from_csv, candles_to_csv
 from bybit_scalper.types import BlockReason, BookTop, Candle, MarketState, OrderStatus
 
@@ -370,6 +370,24 @@ def run_live(cfg: Settings) -> None:
 
 
 def _stream_loop(cfg: Settings, private: bool) -> None:
+    if not private:
+        return _stream_loop_impl(cfg, private=False)
+    import os
+
+    from bybit_scalper.exchange import PybitBroker
+
+    key = os.environ.get("BYBIT_API_KEY", "")
+    secret = os.environ.get("BYBIT_API_SECRET", "")
+    if not key or not secret:
+        raise SystemExit("Нет BYBIT_API_KEY или BYBIT_API_SECRET.")
+    broker = PybitBroker(cfg, key, secret, cfg.instrument())
+    uid = broker.account_identity()
+    environment = "testnet" if cfg.testnet else ("demo" if cfg.demo else "mainnet")
+    with account_lease(environment, uid):
+        return _stream_loop_impl(cfg, private=True, prepared_broker=broker)
+
+
+def _stream_loop_impl(cfg: Settings, private: bool, prepared_broker=None) -> None:
     if not cfg.symbol_allowed():
         raise SystemExit(
             "Символ не разрешён. ETHUSDT включается только после отдельной проверки, eth_enabled: true."
@@ -401,7 +419,7 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
     equity = cfg.d("offline_equity")
     broker: PaperExchange | PybitBroker
     if private:
-        broker = PybitBroker(cfg, key, secret, instrument)
+        broker = prepared_broker or PybitBroker(cfg, key, secret, instrument)
         instrument, fees, equity, server_ms = broker.load_context()
         log.info("комиссии API maker=%s taker=%s источник=%s", fees.maker, fees.taker, fees.source)
         log.info("капитал UNIFIED %s, сервер %s", equity, server_ms)
@@ -814,76 +832,43 @@ def replay_market(cfg: Settings, directory: str = "data/replay") -> str:
     ]
     if not bars:
         return "Файл свечей пуст. Статистика не выдумана."
-    db_path = directory_path / "replay.db"
-    if db_path.exists():
-        db_path.unlink()
-    store = StateStore(str(db_path))
-    paper = PaperExchange(cfg.instrument(), cfg.fallback_fees(), cfg.d("slippage_bps"), Decimal("1"))
-    engine = Engine(cfg, store, paper, cfg.fallback_fees(), cfg.instrument())
-    equity = min(cfg.d("allocated_capital"), cfg.d("offline_equity"))
-    engine.recover(bars[0].ts, equity)
-    window: list[Candle] = []
-    trade_rows = sorted(raw_trades, key=lambda row: int(row.get("T") or 0))
-    trade_at = 0
-    for bar in bars:
-        window.append(bar)
-        now = bar.ts + 60_000
-        while trade_at < len(trade_rows) and int(trade_rows[trade_at].get("T") or 0) <= now:
-            row = trade_rows[trade_at]
-            trade_at += 1
-            price = D(row.get("p") or "0")
-            qty = D(row.get("v") or "0")
-            if price > 0 and qty > 0:
-                engine.on_trade_print(price, qty, int(row.get("T") or 0), True, str(row.get("S") or ""))
-        market = MarketState(
-            bars=list(window),
-            book=book_from_close(bar.c, cfg),
-            now_ms=now,
-            equity=equity,
-            mark=bar.c,
-            funding_rate=Decimal("0"),
-            next_funding_ms=0,
-            connected=True,
-        )
-        engine.on_market(market)
-    trades = store.trades()
-    store.close()
-    reason = (
-        "Время следующего funding в записи отсутствует, журнал funding биржи не подтверждён. "
-        "Новые входы, которые могли бы пересечь funding, заблокированы. Доходность не выдумана."
-        if cfg.mode != "offline"
-        else "Режим offline не имеет биржевых часов funding. Касание свечи не считается исполнением."
+    return (
+        f"Прочитано свечей: {len(bars)}, сделок ленты: {len(raw_trades)}. "
+        "Доходность не рассчитывается: запись содержит только свечи и последние сделки, "
+        "без истории bid/ask, очереди и времени funding. Стакан из close свечи не создаётся. "
+        "Нужна синхронная запись стакана, ленты, закрытых свечей и funding для полноценного replay."
     )
-    report = summarize(
-        trades,
-        engine.submitted,
-        engine.filled_entries,
-        "replay сохранённой ленты",
-        True,
-        [
-            f"Свечей: {len(bars)}. Сделок в ленте: {len(raw_trades)}.",
-            reason,
-            "Очередь paper модельная. Это не результат реального счёта.",
-        ],
-    )
-    return format_report(report)
 
 
 def format_saved_report(cfg: Settings) -> str:
     path = Path("data/last_report.txt")
-    if path.exists():
+    if cfg.mode == "offline" and path.exists():
         return path.read_text(encoding="utf-8")
-    store = StateStore(cfg.state_db)
-    trades = store.trades()
-    store.close()
-    submitted = 0
-    filled = sum(1 for trade in trades if trade.qty > 0)
+    if not Path(cfg.state_db).exists():
+        return "Журнал выбранного режима пока не создан. Синтетический offline-отчёт вместо него не показывается."
+    store = StateStore(cfg.state_db, readonly=True)
+    try:
+        trades = store.trades()
+        submitted = int(store.get_kv("submitted", "0"))
+        filled = int(store.get_kv("filled_entries", "0"))
+        funding = store.sum_cashflow("funding", 0, 10**15)
+        synced = store.get_kv("cashflow_synced_ms", "не подтверждено")
+    finally:
+        store.close()
     report = summarize(
         trades,
         submitted,
         filled,
-        "журнал sqlite",
+        "журнал sqlite: " + cfg.mode,
         True,
-        ["Нет data/last_report.txt. Показаны только уже записанные сделки. Доля исполнений отсюда неизвестна."],
+        [
+            "Profit factor, ожидание и просадка относятся к закрытым сделкам без распределения funding.",
+            "Открытый PnL не включён; это не полная кривая капитала счёта.",
+        ],
     )
-    return format_report(report)
+    return (
+        format_report(report).replace("Чистый PnL:", "Торговый PnL без funding:", 1)
+        + f"\nУчтённый funding: {funding}"
+        + f"\nСумма торгового PnL и funding: {report.net_pnl + funding}"
+        + f"\nПоследняя синхронизация журнала, Unix ms: {synced}"
+    )

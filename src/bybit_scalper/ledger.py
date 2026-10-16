@@ -23,9 +23,11 @@ def cashflow_from_transaction(row: dict) -> tuple[str, str, Decimal, int, list[s
     Returns kind, external id, signed cash, timestamp, alias ids.
     """
     external = str(row.get("id") or "")
-    if not external:
-        return None
     kind_raw = str(row.get("type") or "")
+    if not external:
+        if kind_raw in {"SETTLEMENT", "TRANSFER_IN", "TRANSFER_OUT"}:
+            raise ValueError("cashflow record is missing its unique id")
+        return None
     cash = D(row.get("cashFlow") or "0")
     ts = int(row.get("transactionTime") or 0)
     aliases = [external]
@@ -37,5 +39,11 @@ def cashflow_from_transaction(row: dict) -> tuple[str, str, Decimal, int, list[s
     if kind_raw == "TRANSFER_OUT":
         return "transfer_out", external, cash, ts, aliases
     if kind_raw == "SETTLEMENT":
-        return "funding", external, cash, ts, aliases
+        # V5: cashFlow excludes funding. 'funding' is already signed (receive + / pay -).
+        if row.get("funding") in (None, ""):
+            raise ValueError("SETTLEMENT is missing the funding amount")
+        funding = D(row["funding"])
+        if not funding.is_finite() or ts <= 0:
+            raise ValueError("invalid funding record")
+        return "funding", external, funding, ts, aliases
     return None
