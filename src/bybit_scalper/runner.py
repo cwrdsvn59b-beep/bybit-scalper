@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import hashlib
+from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
@@ -56,6 +57,47 @@ def parse_trades(message: dict) -> list[tuple[Decimal, Decimal, int, str]]:
     for row in message.get("data") or []:
         prints.append((D(row["p"]), D(row["v"]), int(row["T"]), str(row["S"])))
     return prints
+
+
+class PrivateQueue:
+    """Private executions are not evicted to make room for quotes.
+
+    A full private buffer drops the new event and counts it. The loop then blocks entries.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self.maxsize = maxsize
+        self.dropped = 0
+        self._items: deque[str] = deque()
+
+    def put_nowait(self, item: str) -> None:
+        if len(self._items) >= self.maxsize:
+            self.dropped += 1
+            return
+        self._items.append(item)
+
+    def get_nowait(self) -> str:
+        if not self._items:
+            raise queue.Empty
+        return self._items.popleft()
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+
+def take_private_then_public(private_q: PrivateQueue, public_q: queue.Queue, timeout: float):
+    """Drain every queued private event, then take at most one public message."""
+    private_batch: list[str] = []
+    while True:
+        try:
+            private_batch.append(private_q.get_nowait())
+        except queue.Empty:
+            break
+    try:
+        public_item = public_q.get(timeout=timeout)
+    except queue.Empty:
+        public_item = None
+    return private_batch, public_item
 
 
 def upsert_candle(bars: list[Candle], candle: Candle) -> None:
@@ -255,6 +297,9 @@ def _notes(cfg: Settings, count: int) -> str:
             "- Комиссии offline: maker 0.020%, taker 0.055%, пока API не подменит их.",
             "- В риск входа заложена taker-комиссия, даже если фактический отдых в стакане был бы maker.",
             f"- Поток сделок в конфиге: {'включён' if cfg.trade_flow_enabled else 'выключен'}.",
+            f"- Выделенный капитал: {cfg.d('allocated_capital')}. Это не весь UNIFIED equity.",
+            "- Offline не имеет биржевых часов funding, поэтому next_funding=0 вход не блокирует.",
+            "- Paper, testnet и live без подтверждённого времени funding новые входы не ставят.",
         ]
     )
 
@@ -381,6 +426,14 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
     if not private:
         broker.position = store.load_position()
     engine.recover(int(time.time() * 1000), equity)
+    if private and hasattr(broker, "read_account"):
+        try:
+            engine.apply_account(broker.read_account())
+        except Exception as exc:
+            engine.margin_verified = False
+            log.warning("маржа не подтверждена, новые входы закрыты: %s", exc)
+    if private and hasattr(broker, "sync_cashflows"):
+        engine.funding_ledger_confirmed = bool(broker.sync_cashflows(store))
     if not private:
         trades = store.trades()
         broker.realized = sum((t.pnl + t.fees for t in trades), D('0')) + engine.round_pnl + engine.round_fees
@@ -399,13 +452,14 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
         engine.on_reconnect()
     engine.note_clock(int(time.time() * 1000), server_ms)
     messages: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
+    private_messages = PrivateQueue(cfg.queue_max)
     overflow = [False]
     stream = PublicStream(cfg, messages, overflow)
     stream.start()
     private_ws = None
     if private:
         try:
-            private_ws = _start_private(cfg, key, secret, messages, overflow)
+            private_ws = _start_private(cfg, key, secret, private_messages, overflow)
         except BaseException:
             stream.close()
             store.close()
@@ -451,11 +505,28 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
             if now_wall - last_aux > 30:
                 last_aux = now_wall
                 funding_rate, next_funding = _refresh_public(market_http, cfg, engine, funding_rate, next_funding)
-                if private:
-                    equity = broker.account_equity()
-            try:
-                raw = messages.get(timeout=0.5)
-            except queue.Empty:
+                if private and hasattr(broker, "account_equity"):
+                    try:
+                        equity = broker.account_equity()
+                    except Exception:
+                        engine.margin_verified = False
+                if private and hasattr(broker, "read_account"):
+                    try:
+                        engine.apply_account(broker.read_account())
+                    except Exception:
+                        engine.margin_verified = False
+                if private and hasattr(broker, "sync_cashflows"):
+                    engine.funding_ledger_confirmed = bool(broker.sync_cashflows(store))
+            batch, raw = take_private_then_public(private_messages, messages, 0.5)
+            for item in batch:
+                try:
+                    private_message = json.loads(item)
+                except json.JSONDecodeError:
+                    continue
+                _dispatch_private(private_message, engine, broker if private else None, cfg)
+            if private_messages.dropped:
+                engine._block(BlockReason.UNKNOWN_POSITION, "private queue overflow")
+            if raw is None:
                 _mark_link(engine, stream, book, bars, equity, overflow, funding_rate, next_funding)
                 continue
             try:
@@ -636,13 +707,32 @@ def candles_contiguous(bars: list[Candle]) -> bool:
     return bool(bars) and all(right.ts - left.ts == 60_000 for left, right in zip(bars, bars[1:]))
 
 
-def _start_private(cfg: Settings, key: str, secret: str, messages: queue.Queue, overflow: list[bool]):
+def _dispatch_private(message: dict, engine: Engine, broker, cfg: Settings) -> None:
+    topic = str(message.get("topic") or "")
+    if topic == "execution" and broker is not None and hasattr(broker, "ingest_execution_message"):
+        for ex in broker.ingest_execution_message(message):
+            engine.on_exec(ex)
+        return
+    if topic == "order":
+        from bybit_scalper.exchange import map_order_status
+
+        for row in message.get("data") or []:
+            if row.get("symbol") != cfg.symbol:
+                continue
+            link = str(row.get("orderLinkId") or "")
+            if link:
+                engine.note_remote_status(link, map_order_status(row.get("orderStatus")))
+
+
+def _start_private(cfg: Settings, key: str, secret: str, messages, overflow: list[bool]):
     from pybit.unified_trading import WebSocket
 
     def callback(message) -> None:
+        payload = json.dumps(message) if not isinstance(message, str) else message
         try:
-            messages.put_nowait(json.dumps(message) if not isinstance(message, str) else message)
+            messages.put_nowait(payload)
         except queue.Full:
+            # queue.Queue only. PrivateQueue records its own drop and does not raise.
             overflow[0] = True
 
     ws = WebSocket(
@@ -656,6 +746,127 @@ def _start_private(cfg: Settings, key: str, secret: str, messages: queue.Queue, 
     ws.execution_stream(callback)
     ws.position_stream(callback)
     return ws
+
+
+def collect_market(cfg: Settings, directory: str = "data/replay") -> str:
+    """Public klines and public trades. A network error is fatal: no synthetic tape is written."""
+    session = _public_http(cfg)
+    try:
+        bars = _fetch_public_klines(session, cfg)
+        trades = _fetch_public_trades(session, cfg)
+    except Exception as exc:
+        raise SystemExit(
+            "Сбор рыночных данных не выполнен, заглушка не создана. "
+            f"Причина: {exc}"
+        ) from exc
+    if not bars:
+        raise SystemExit("Публичные свечи не получены. Файл не создан.")
+    out = Path(directory)
+    out.mkdir(parents=True, exist_ok=True)
+    kline_path = out / f"{cfg.symbol}_klines.json"
+    trade_path = out / f"{cfg.symbol}_trades.json"
+    kline_path.write_text(
+        json.dumps(
+            [
+                {"ts": bar.ts, "o": str(bar.o), "h": str(bar.h), "l": str(bar.l), "c": str(bar.c), "v": str(bar.v)}
+                for bar in bars
+            ]
+        ),
+        encoding="utf-8",
+    )
+    trade_path.write_text(json.dumps(trades), encoding="utf-8")
+    return (
+        f"Собрано свечей: {len(bars)}, публичных сделок: {len(trades)}. "
+        f"Файлы: {kline_path}, {trade_path}. Это не отчёт доходности."
+    )
+
+
+def _fetch_public_trades(session, cfg: Settings) -> list[dict]:
+    resp = session.get_public_trade_history(category=cfg.category, symbol=cfg.symbol, limit=1000)
+    rows = (resp.get("result") or {}).get("list") or []
+    trades = []
+    for row in rows:
+        trades.append(
+            {
+                "p": str(row.get("price") or row.get("p") or ""),
+                "v": str(row.get("size") or row.get("v") or ""),
+                "T": int(row.get("time") or row.get("T") or 0),
+                "S": str(row.get("side") or row.get("S") or ""),
+            }
+        )
+    return trades
+
+
+def replay_market(cfg: Settings, directory: str = "data/replay") -> str:
+    directory_path = Path(directory)
+    kline_path = directory_path / f"{cfg.symbol}_klines.json"
+    trade_path = directory_path / f"{cfg.symbol}_trades.json"
+    if not kline_path.exists() or not trade_path.exists():
+        return (
+            "Лента не собрана. Статистика не выдумана. "
+            "Сначала команда collect на машине с доступом к публичному API Bybit."
+        )
+    raw_bars = json.loads(kline_path.read_text(encoding="utf-8"))
+    raw_trades = json.loads(trade_path.read_text(encoding="utf-8"))
+    bars = [
+        Candle(ts=int(row["ts"]), o=D(row["o"]), h=D(row["h"]), l=D(row["l"]), c=D(row["c"]), v=D(row["v"]))
+        for row in raw_bars
+    ]
+    if not bars:
+        return "Файл свечей пуст. Статистика не выдумана."
+    db_path = directory_path / "replay.db"
+    if db_path.exists():
+        db_path.unlink()
+    store = StateStore(str(db_path))
+    paper = PaperExchange(cfg.instrument(), cfg.fallback_fees(), cfg.d("slippage_bps"), Decimal("1"))
+    engine = Engine(cfg, store, paper, cfg.fallback_fees(), cfg.instrument())
+    equity = min(cfg.d("allocated_capital"), cfg.d("offline_equity"))
+    engine.recover(bars[0].ts, equity)
+    window: list[Candle] = []
+    trade_rows = sorted(raw_trades, key=lambda row: int(row.get("T") or 0))
+    trade_at = 0
+    for bar in bars:
+        window.append(bar)
+        now = bar.ts + 60_000
+        while trade_at < len(trade_rows) and int(trade_rows[trade_at].get("T") or 0) <= now:
+            row = trade_rows[trade_at]
+            trade_at += 1
+            price = D(row.get("p") or "0")
+            qty = D(row.get("v") or "0")
+            if price > 0 and qty > 0:
+                engine.on_trade_print(price, qty, int(row.get("T") or 0), True, str(row.get("S") or ""))
+        market = MarketState(
+            bars=list(window),
+            book=book_from_close(bar.c, cfg),
+            now_ms=now,
+            equity=equity,
+            mark=bar.c,
+            funding_rate=Decimal("0"),
+            next_funding_ms=0,
+            connected=True,
+        )
+        engine.on_market(market)
+    trades = store.trades()
+    store.close()
+    reason = (
+        "Время следующего funding в записи отсутствует, журнал funding биржи не подтверждён. "
+        "Новые входы, которые могли бы пересечь funding, заблокированы. Доходность не выдумана."
+        if cfg.mode != "offline"
+        else "Режим offline не имеет биржевых часов funding. Касание свечи не считается исполнением."
+    )
+    report = summarize(
+        trades,
+        engine.submitted,
+        engine.filled_entries,
+        "replay сохранённой ленты",
+        True,
+        [
+            f"Свечей: {len(bars)}. Сделок в ленте: {len(raw_trades)}.",
+            reason,
+            "Очередь paper модельная. Это не результат реального счёта.",
+        ],
+    )
+    return format_report(report)
 
 
 def format_saved_report(cfg: Settings) -> str:

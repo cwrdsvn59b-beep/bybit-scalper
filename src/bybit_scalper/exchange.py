@@ -10,7 +10,17 @@ import requests
 from bybit_scalper.config import Settings
 from bybit_scalper.decimals import D
 from bybit_scalper.risk import new_link_id
-from bybit_scalper.types import Exec, Fees, Instrument, OrderStatus, PlaceResult, Position, Side, StopResult
+from bybit_scalper.types import (
+    AccountView,
+    Exec,
+    Fees,
+    Instrument,
+    OrderStatus,
+    PlaceResult,
+    Position,
+    Side,
+    StopResult,
+)
 
 log = logging.getLogger("bybit_scalper")
 
@@ -256,6 +266,110 @@ class PybitBroker:
         if equity <= 0:
             raise RuntimeError("Не удалось подтвердить положительный капитал UNIFIED")
         return equity
+
+    def read_account(self) -> AccountView:
+        """Read margin facts. Does not call set_leverage or switch margin/position mode."""
+        bal = self._call("get_wallet_balance", accountType="UNIFIED")
+        row = ((bal.get("result") or {}).get("list") or [{}])[0]
+        equity = D(row.get("totalEquity") or "0")
+        available = D(row.get("totalAvailableBalance") or "0")
+        info = self._call("get_account_info")
+        margin_mode = str((info.get("result") or {}).get("marginMode") or "")
+        pos = self._call("get_positions", category=self.cfg.category, symbol=self.cfg.symbol)
+        rows = (pos.get("result") or {}).get("list") or []
+        chosen = None
+        for item in rows:
+            if int(item.get("positionIdx") or 0) == 0:
+                chosen = item
+                break
+        leverage = D((chosen or {}).get("leverage") or "0")
+        raw_mode = None if chosen is None else chosen.get("tradeMode")
+        trade_mode = None if raw_mode is None or raw_mode == "" else int(raw_mode)
+        verified = True
+        label = {0: "cross", 1: "isolated"}.get(trade_mode, "unknown")
+        if margin_mode == "PORTFOLIO_MARGIN":
+            verified = False
+            label = "portfolio"
+        if trade_mode not in (0, 1):
+            verified = False
+        if not (D("0") < leverage <= self.cfg.d("max_leverage")):
+            verified = False
+        if equity <= 0:
+            verified = False
+        return AccountView(equity, available, label, leverage, verified)
+
+    def sync_cashflows(self, store) -> bool:
+        """Load funding and transfers. False means the ledger is not confirmed, even after partial writes."""
+        try:
+            self._paginate_funding_executions(store)
+            self._paginate_transaction_log(store)
+        except Exception:
+            log.warning("журнал funding не подтверждён")
+            return False
+        return True
+
+    def _paginate_funding_executions(self, store) -> None:
+        from bybit_scalper.ledger import funding_from_execution
+
+        cursor = ""
+        seen: set[str] = set()
+        for _page in range(50):
+            params = dict(
+                category=self.cfg.category,
+                symbol=self.cfg.symbol,
+                limit=100,
+                execType="Funding",
+            )
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._call("get_executions", **params)
+            payload = resp.get("result") or {}
+            for row in payload.get("list") or []:
+                if row.get("symbol") not in (None, "", self.cfg.symbol):
+                    continue
+                parsed = funding_from_execution(row)
+                if parsed is None:
+                    continue
+                exec_id, cash, ts, aliases = parsed
+                store.add_cashflow("execution", exec_id, "funding", cash, ts, aliases)
+            cursor = payload.get("nextPageCursor") or ""
+            if not cursor:
+                return
+            if cursor in seen:
+                raise RuntimeError("funding execution cursor repeated")
+            seen.add(cursor)
+        raise RuntimeError("funding execution pagination truncated")
+
+    def _paginate_transaction_log(self, store) -> None:
+        from bybit_scalper.ledger import cashflow_from_transaction
+
+        cursor = ""
+        seen: set[str] = set()
+        for _page in range(50):
+            params = dict(accountType="UNIFIED", category="linear", limit=50)
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._call("get_transaction_log", **params)
+            payload = resp.get("result") or {}
+            for row in payload.get("list") or []:
+                currency = str(row.get("currency") or "")
+                if currency and currency != "USDT":
+                    continue
+                parsed = cashflow_from_transaction(row)
+                if parsed is None:
+                    continue
+                kind, external, cash, ts, aliases = parsed
+                symbol = str(row.get("symbol") or "")
+                if kind == "funding" and symbol and symbol != self.cfg.symbol:
+                    continue
+                store.add_cashflow("transaction", external, kind, cash, ts, aliases)
+            cursor = payload.get("nextPageCursor") or ""
+            if not cursor:
+                return
+            if cursor in seen:
+                raise RuntimeError("transaction log cursor repeated")
+            seen.add(cursor)
+        raise RuntimeError("transaction log pagination truncated")
 
     def funding(self) -> tuple[Decimal, int]:
         resp = self._call("get_tickers", category=self.cfg.category, symbol=self.cfg.symbol)

@@ -82,6 +82,19 @@ class StateStore:
                 slippage TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cashflows (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                cash TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                PRIMARY KEY (source, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS cashflow_aliases (
+                alias TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL
+            );
             """
         )
         self._commit()
@@ -130,6 +143,51 @@ class StateStore:
         )
         self._commit()
         return cur.rowcount == 1
+
+    def add_cashflow(
+        self,
+        source: str,
+        external_id: str,
+        kind: str,
+        cash: Decimal,
+        ts: int,
+        aliases: list[str],
+    ) -> bool:
+        """False if any alias is already stored. That blocks execution/log double counting."""
+        keys: list[str] = []
+        for alias in [external_id, *aliases]:
+            if alias and alias not in keys:
+                keys.append(alias)
+        if not external_id or not keys:
+            return False
+        for alias in keys:
+            found = self.conn.execute(
+                "SELECT 1 FROM cashflow_aliases WHERE alias = ?",
+                (alias,),
+            ).fetchone()
+            if found:
+                return False
+        self.conn.execute(
+            "INSERT INTO cashflows (source, external_id, kind, cash, ts) VALUES (?, ?, ?, ?, ?)",
+            (source, external_id, kind, str(cash), int(ts)),
+        )
+        for alias in keys:
+            self.conn.execute(
+                "INSERT INTO cashflow_aliases (alias, source, external_id) VALUES (?, ?, ?)",
+                (alias, source, external_id),
+            )
+        self._commit()
+        return True
+
+    def sum_cashflow(self, kind: str, start_ms: int, end_ms: int) -> Decimal:
+        rows = self.conn.execute(
+            "SELECT cash FROM cashflows WHERE kind = ? AND ts >= ? AND ts < ?",
+            (kind, int(start_ms), int(end_ms)),
+        ).fetchall()
+        total = Decimal("0")
+        for (cash,) in rows:
+            total += D(cash)
+        return total
 
     def save_order(self, order: OrderView | None) -> None:
         self.conn.execute("DELETE FROM orders")
