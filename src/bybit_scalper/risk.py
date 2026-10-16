@@ -110,6 +110,8 @@ def build_plan(
         stop = ceil_tick(signal.stop_ref + buffer, instrument.tick)
         if stop <= entry:
             return Plan(False, "стоп не выше входа")
+    if stop <= 0:
+        return Plan(False, "цена стопа должна быть положительной")
 
     fee_in = entry_fee_rate(cfg, fees)
     fee_out = fees.taker
@@ -139,6 +141,8 @@ def build_plan(
             return Plan(False, "противоположный уровень ближе минимальной цели")
     else:
         target = floor_tick(raw_target, instrument.tick)
+        if target <= 0:
+            return Plan(False, "цена цели должна быть положительной")
         if signal.opposite > target:
             return Plan(False, "противоположный уровень ближе минимальной цели")
 
@@ -148,6 +152,8 @@ def build_plan(
     capped = floor_step(max_notional / entry, instrument.qty_step)
     if qty > capped:
         qty = capped
+    if instrument.max_qty > 0:
+        qty = min(qty, floor_step(instrument.max_qty, instrument.qty_step))
     if qty < instrument.min_qty or qty * entry < instrument.min_notional:
         min_loss = instrument.min_qty * loss_1
         return Plan(False, "минимальный ордер превышает допустимый риск" if min_loss > budget else "объём ниже минимума")

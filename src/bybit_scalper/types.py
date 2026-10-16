@@ -50,6 +50,7 @@ class Instrument:
     qty_step: Decimal
     min_qty: Decimal
     min_notional: Decimal
+    max_qty: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)

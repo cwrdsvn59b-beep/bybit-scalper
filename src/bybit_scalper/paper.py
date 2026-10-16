@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from uuid import uuid4
 
 from bybit_scalper.decimals import D
 from bybit_scalper.types import Exec, Fees, Instrument, OrderStatus, PlaceResult, Position, Side, StopResult
@@ -45,6 +46,7 @@ class PaperExchange:
         self.fees_paid = Decimal("0")
         self.slippage_paid = Decimal("0")
         self._exec_n = 0
+        self._session_id = uuid4().hex
         self.server_ms = 0
 
     def place_limit(
@@ -94,7 +96,7 @@ class PaperExchange:
         if order and order.filled < order.qty and order.status != OrderStatus.FILLED:
             order.status = OrderStatus.CANCELLED
 
-    def match_trade(self, price: Decimal, qty: Decimal) -> list[Exec]:
+    def match_trade(self, price: Decimal, qty: Decimal, taker_side: str | None = None) -> list[Exec]:
         """Сделка ленты. Касание фитилём сюда не передаётся."""
         produced: list[Exec] = []
         left = qty
@@ -102,6 +104,8 @@ class PaperExchange:
             if left <= 0:
                 break
             if order.status not in {OrderStatus.SUBMITTED, OrderStatus.PARTIAL}:
+                continue
+            if taker_side and taker_side != ("Sell" if order.side is Side.LONG else "Buy"):
                 continue
             crosses = price <= order.price if order.side is Side.LONG else price >= order.price
             if not crosses:
@@ -140,7 +144,7 @@ class PaperExchange:
         self.position.target = Decimal("0")
         self.position.stop_confirmed = False
 
-    def close_market(self, qty: Decimal, side: Side, mark: Decimal, ts: int) -> Exec:
+    def close_market(self, qty: Decimal, side: Side, mark: Decimal, ts: int, *, link_id: str = "emergency") -> Exec:
         if not self.position.is_open():
             raise RuntimeError("no position to close")
         self.http_calls.append("market_reduce")
@@ -151,7 +155,9 @@ class PaperExchange:
         else:
             price = mark + slip
         self.slippage_paid += slip * qty
-        exec_ = self._fill_position(side, qty, price, ts, reduce_only=True, maker=False, link_id="emergency")
+        exec_ = self._fill_position(side, qty, price, ts, reduce_only=True, maker=False, link_id=link_id)
+        self.orders[link_id] = Resting(link_id, side, price, qty, qty, D('0'),
+                                     OrderStatus.FILLED, True, [exec_])
         return exec_
 
     def _fill(self, order: Resting, qty: Decimal, price: Decimal, maker: bool) -> Exec:
@@ -162,7 +168,7 @@ class PaperExchange:
         order.filled += qty
         order.status = OrderStatus.FILLED if order.filled >= order.qty else OrderStatus.PARTIAL
         exec_ = Exec(
-            exec_id=f"exec-{self._exec_n}",
+            exec_id=f"paper-{self._session_id}-{self._exec_n}",
             link_id=order.link_id,
             side="Buy" if order.side is Side.LONG else "Sell",
             qty=qty,
@@ -181,7 +187,7 @@ class PaperExchange:
         fee = qty * price * fee_rate
         self.fees_paid += fee
         exec_ = Exec(
-            exec_id=f"exec-{self._exec_n}",
+            exec_id=f"paper-{self._session_id}-{self._exec_n}",
             link_id=link_id,
             side="Buy" if side is Side.LONG else "Sell",
             qty=qty,
@@ -191,6 +197,8 @@ class PaperExchange:
             reduce_only=reduce_only,
         )
         self._apply_position(side, qty, price, reduce_only)
+        if reduce_only:
+            exec_.side = "Sell" if side is Side.LONG else "Buy"
         return exec_
 
     def _apply_position(self, side: Side, qty: Decimal, price: Decimal, reduce_only: bool) -> None:

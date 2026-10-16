@@ -5,6 +5,7 @@ import logging
 import queue
 import threading
 import time
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 
@@ -50,10 +51,10 @@ def parse_kline(message: dict) -> tuple[Candle, bool] | None:
     return candle, bool(row.get("confirm"))
 
 
-def parse_trades(message: dict) -> list[tuple[Decimal, Decimal, int]]:
+def parse_trades(message: dict) -> list[tuple[Decimal, Decimal, int, str]]:
     prints = []
     for row in message.get("data") or []:
-        prints.append((D(row["p"]), D(row["v"]), int(row["T"])))
+        prints.append((D(row["p"]), D(row["v"]), int(row["T"]), str(row["S"])))
     return prints
 
 
@@ -83,6 +84,18 @@ class PublicStream:
         self.needs_reconcile = False
         self.last_error = ""
         self._thread: threading.Thread | None = None
+        self.generation = 0
+        self.resubscribe = threading.Event()
+        self._ws = None
+
+    def request_snapshot(self) -> None:
+        self.resubscribe.set()
+        ws = self._ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def url(self) -> str:
         if self.cfg.demo and self.cfg.testnet:
@@ -101,6 +114,7 @@ class PublicStream:
 
     def close(self) -> None:
         self.stop.set()
+        self.request_snapshot()
 
     def _run(self) -> None:
         import websocket
@@ -110,30 +124,42 @@ class PublicStream:
             ws = None
             try:
                 ws = websocket.create_connection(self.url(), timeout=10)
-                args = [f"kline.1.{self.cfg.symbol}", f"orderbook.50.{self.cfg.symbol}"]
-                if self.cfg.trade_flow_enabled:
-                    args.append(f"publicTrade.{self.cfg.symbol}")
+                self._ws = ws
+                self.resubscribe.clear()
+                self.generation += 1
+                generation = self.generation
+                args = [f"kline.1.{self.cfg.symbol}", f"orderbook.50.{self.cfg.symbol}",
+                        f"publicTrade.{self.cfg.symbol}"]
                 ws.send(json.dumps({"op": "subscribe", "args": args}))
                 self.connected = True
                 self.needs_reconcile = True
                 ws.settimeout(5)
                 last_ping = time.time()
-                while not self.stop.is_set():
+                last_received = time.monotonic()
+                while not self.stop.is_set() and not self.resubscribe.is_set():
                     if time.time() - last_ping >= 20:
                         ws.send(json.dumps({"op": "ping"}))
                         last_ping = time.time()
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
+                        if time.monotonic() - last_received > 30:
+                            raise TimeoutError("public stream heartbeat expired")
                         continue
                     if not raw:
                         break
                     if isinstance(raw, bytes):
                         raw = raw.decode()
+                    last_received = time.monotonic()
+                    parsed = json.loads(raw)
+                    if parsed.get("success") is False:
+                        raise RuntimeError("public subscription rejected")
+                    parsed["_generation"] = generation
                     try:
-                        self.messages.put_nowait(raw)
+                        self.messages.put_nowait(json.dumps(parsed))
                     except queue.Full:
                         self.overflow[0] = True
+                        self.resubscribe.set()
             except Exception as exc:
                 self.last_error = str(exc)
                 self.connected = False
@@ -323,6 +349,8 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
         history.pop()
     if len(history) < cfg.min_1m_bars:
         raise SystemExit(f"Мало минутных свечей для старта: {len(history)}")
+    if not candles_contiguous(history):
+        raise SystemExit("История свечей содержит пропуски или дубликаты")
     instrument = cfg.instrument()
     fees = cfg.fallback_fees()
     equity = cfg.d("offline_equity")
@@ -333,6 +361,13 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
         log.info("комиссии API maker=%s taker=%s источник=%s", fees.maker, fees.taker, fees.source)
         log.info("капитал UNIFIED %s, сервер %s", equity, server_ms)
     else:
+        meta_resp = market_http.get_instruments_info(category=cfg.category, symbol=cfg.symbol)
+        meta = meta_resp["result"]["list"][0]
+        lot = meta["lotSizeFilter"]
+        from bybit_scalper.types import Instrument
+        instrument = Instrument(cfg.symbol, D(meta["priceFilter"]["tickSize"]), D(lot["qtyStep"]),
+                                D(lot["minOrderQty"]), D(lot.get("minNotionalValue") or "0"),
+                                min(D(lot["maxOrderQty"]), D(lot["maxMktOrderQty"])))
         broker = PaperExchange(instrument, fees, cfg.d("slippage_bps"), Decimal("1"))
         log.info("paper: ключи не используются, комиссии из конфигурации %s", fees.source)
         try:
@@ -341,9 +376,27 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
             server_ms = int(time.time() * 1000)
     store = StateStore(cfg.state_db)
     engine = Engine(cfg, store, broker, fees, instrument)
-    engine.recover(history[-1].ts, equity)
+    fingerprint = hashlib.sha256(key.encode()).hexdigest()[:16] if private else "paper"
+    store.bind_identity(cfg.mode, cfg.symbol, fingerprint)
+    if not private:
+        broker.position = store.load_position()
+    engine.recover(int(time.time() * 1000), equity)
+    if not private:
+        trades = store.trades()
+        broker.realized = sum((t.pnl + t.fees for t in trades), D('0')) + engine.round_pnl + engine.round_fees
+        broker.fees_paid = sum((t.fees for t in trades), D('0')) + engine.round_fees + engine.open_fees
+        if engine.order and engine.order.active:
+            # A simulator has no remote order after restart. Resume its known remaining
+            # intent so expiry can cancel it, rather than silently inventing a terminal status.
+            order = engine.order
+            broker.place_limit(order.link_id, order.side, order.qty, order.price)
+            broker.orders[order.link_id].filled = order.filled
     if private:
-        engine.reconcile()
+        allowed_link = engine.order.link_id if engine.order else None
+        if any(row.get("orderLinkId") != allowed_link for row in broker.open_entry_orders()):
+            store.close()
+            raise SystemExit("Обнаружены неизвестные входные заявки. Нужна ручная сверка субсчёта.")
+        engine.on_reconnect()
     engine.note_clock(int(time.time() * 1000), server_ms)
     messages: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
     overflow = [False]
@@ -351,37 +404,67 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
     stream.start()
     private_ws = None
     if private:
-        private_ws = _start_private(cfg, key, secret, messages, overflow)
+        try:
+            private_ws = _start_private(cfg, key, secret, messages, overflow)
+        except BaseException:
+            stream.close()
+            store.close()
+            raise
     book = OrderBook()
     bars = history
     last_reconcile = time.time()
     last_aux = 0.0
+    public_generation = 0
+    private_generation = id(private_ws.ws) if private_ws else None
+    recovering_stream = True
     funding_rate = Decimal("0")
     next_funding = 0
     log.info("цикл запущен, режим %s, символ %s. Остановка: Ctrl+C", cfg.mode, cfg.symbol)
     try:
         while True:
-            if stream.needs_reconcile and engine.block == BlockReason.DISCONNECT:
-                stream.needs_reconcile = False
+            private_ok = not private or (private_ws.is_connected() and private_ws.auth)
+            generation = id(private_ws.ws) if private_ws else None
+            if (overflow[0] or stream.generation != public_generation or generation != private_generation
+                    or not stream.connected or not private_ok):
+                if not recovering_stream or stream.generation != public_generation or overflow[0]:
+                    book.reset()
+                    engine.on_disconnect()
+                    recovering_stream = True
+                if overflow[0]:
+                    stream.request_snapshot()
+                    overflow[0] = False
+                public_generation = stream.generation
+                private_generation = generation
+            if recovering_stream and stream.connected and private_ok and book.valid:
+                # Backfill closed candles before enabling entries after any stream interruption.
+                refreshed = _fetch_public_klines(market_http, cfg)
+                now_ms = int(time.time() * 1000)
+                bars = [bar for bar in refreshed if bar.ts + 60_000 <= now_ms]
+                if not candles_contiguous(bars):
+                    raise RuntimeError("Пропуски в свечах после восстановления")
                 engine.on_reconnect()
+                recovering_stream = False
             now_wall = time.time()
+            if private and now_wall - last_reconcile >= 5:
+                engine.reconcile()
+                last_reconcile = time.time()
             if now_wall - last_aux > 30:
                 last_aux = now_wall
                 funding_rate, next_funding = _refresh_public(market_http, cfg, engine, funding_rate, next_funding)
+                if private:
+                    equity = broker.account_equity()
             try:
                 raw = messages.get(timeout=0.5)
             except queue.Empty:
                 _mark_link(engine, stream, book, bars, equity, overflow, funding_rate, next_funding)
-                if private and time.time() - last_reconcile > 5 and engine.order and engine.order.active:
-                    engine.note_request(int(time.time() * 1000))
-                    engine.reconcile()
-                    last_reconcile = time.time()
                 continue
             try:
                 message = json.loads(raw)
             except json.JSONDecodeError:
                 continue
             topic = str(message.get("topic") or "")
+            if "_generation" in message and message["_generation"] != public_generation:
+                continue
             if message.get("op") in {"pong", "ping"} or message.get("success") is True:
                 continue
             if topic.startswith("kline"):
@@ -390,17 +473,35 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
                     continue
                 candle, confirmed = parsed
                 if confirmed:
+                    if bars and candle.ts > bars[-1].ts + 60_000:
+                        engine.on_disconnect()
+                        recovering_stream = True
+                        book.reset()
+                        stream.request_snapshot()
+                        continue
                     upsert_candle(bars, candle)
                     _on_market(engine, bars, book, equity, candle.c, overflow, funding_rate, next_funding, stream)
                 else:
                     engine.mark = candle.c
             elif topic.startswith("orderbook"):
                 book.apply(message)
+                if book.reset_needed:
+                    engine.on_disconnect()
+                    recovering_stream = True
+                    stream.request_snapshot()
                 if bars:
-                    _on_market(engine, bars, book, equity, bars[-1].c, overflow, funding_rate, next_funding, stream)
+                    top = book.top()
+                    mark = (top[0] + top[1]) / D(2) if top else engine.mark
+                    _on_market(engine, bars, book, equity, mark, overflow, funding_rate, next_funding, stream)
             elif topic.startswith("publicTrade"):
-                for price, qty, ts in parse_trades(message):
-                    engine.on_trade_print(price, qty, ts, simulate_fill=not private)
+                latest_price = None
+                for price, qty, ts, taker_side in parse_trades(message):
+                    if int(time.time() * 1000) - ts > cfg.stale_book_ms:
+                        continue
+                    engine.on_trade_print(price, qty, ts, simulate_fill=not private, taker_side=taker_side)
+                    latest_price = price
+                if latest_price is not None:
+                    _on_market(engine, bars, book, equity, latest_price, overflow, funding_rate, next_funding, stream)
             elif topic == "execution" and private:
                 for ex in broker.ingest_execution_message(message):  # type: ignore[union-attr]
                     engine.on_exec(ex)
@@ -408,15 +509,20 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
                 for row in message.get("data") or []:
                     from bybit_scalper.exchange import map_order_status
 
+                    if row.get("symbol") != cfg.symbol:
+                        continue
                     link = str(row.get("orderLinkId") or "")
                     if link:
                         engine.note_remote_status(link, map_order_status(row.get("orderStatus")))
             elif topic == "position" and private:
-                engine.reconcile()
+                pass  # REST reconciliation has its own periodic schedule, even on a busy stream.
     except KeyboardInterrupt:
         log.info("остановка по Ctrl+C")
-        _shutdown(engine)
     finally:
+        try:
+            _shutdown(engine)
+        except Exception:
+            log.exception("Сверьте состояние позиции и заявок на бирже после ошибки остановки")
         stream.close()
         if private_ws is not None:
             try:
@@ -438,13 +544,17 @@ def _on_market(engine, bars, book: OrderBook, equity, mark, overflow, funding_ra
         bid, ask, _bid_qty, _ask_qty = top
         bid_depth, ask_depth = book.depth_qty(engine.cfg.d("depth_bps"))
         view = BookTop(bid, ask, bid_depth, ask_depth, book.ts, book.valid and not book.reset_needed)
+    if isinstance(engine.exchange, PaperExchange):
+        paper = engine.exchange
+        equity = (engine.cfg.d("offline_equity") + paper.realized - paper.fees_paid
+                  + paper.unrealized(mark))
     market = MarketState(
         bars=list(bars),
         book=view,
         now_ms=now,
         equity=equity,
         mark=mark,
-        stale=stale_book or stale_candle or not stream.connected,
+        stale=stale_book or stale_candle or not stream.connected or not candles_contiguous(bars),
         queue_overflow=overflow[0],
         funding_rate=funding_rate,
         next_funding_ms=next_funding,
@@ -498,13 +608,32 @@ def _public_http(cfg: Settings):
 
 
 def _fetch_public_klines(session, cfg: Settings) -> list[Candle]:
-    resp = session.get_kline(category=cfg.category, symbol=cfg.symbol, interval="1", limit=1000)
-    rows = list(reversed((resp.get("result") or {}).get("list") or []))
+    now = int(time.time() * 1000)
+    start = min(now - cfg.min_1m_bars * 60_000 - 300_000, now // 86_400_000 * 86_400_000)
+    rows = []
+    end = now
+    while True:
+        resp = session.get_kline(category=cfg.category, symbol=cfg.symbol, interval="1", limit=1000, end=end)
+        page = (resp.get("result") or {}).get("list") or []
+        if not page:
+            break
+        rows.extend(page)
+        oldest = min(int(item[0]) for item in page)
+        if oldest <= start:
+            break
+        if oldest >= end:
+            raise RuntimeError("kline pagination did not advance")
+        end = oldest - 1
+    rows = sorted({int(item[0]): item for item in rows}.values(), key=lambda item: int(item[0]))
     candles = [
         Candle(ts=int(item[0]), o=D(item[1]), h=D(item[2]), l=D(item[3]), c=D(item[4]), v=D(item[5]))
         for item in rows
     ]
     return candles
+
+
+def candles_contiguous(bars: list[Candle]) -> bool:
+    return bool(bars) and all(right.ts - left.ts == 60_000 for left, right in zip(bars, bars[1:]))
 
 
 def _start_private(cfg: Settings, key: str, secret: str, messages: queue.Queue, overflow: list[bool]):

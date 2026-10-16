@@ -23,8 +23,9 @@ def test_snapshot_delta_gap_and_delete():
     assert book.valid
     assert book.top()[0] == D(99)
     book.apply({"type": "delta", "ts": 12, "data": {"u": 4, "b": [], "a": []}})
-    assert not book.valid
-    assert book.reset_needed
+    assert book.valid  # Bybit does not guarantee u increases by one.
+    book.reset()  # Actual transport loss invalidates the book.
+    assert not book.valid and book.reset_needed
 
 
 def test_crossed_book_is_invalid():

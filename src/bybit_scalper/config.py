@@ -94,4 +94,21 @@ def load_settings(path: str | Path, mode: str | None = None) -> Settings:
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"Неизвестные поля конфигурации: {sorted(unknown)}")
-    return Settings(**raw)
+    cfg = Settings(**raw)
+    if cfg.category != "linear" or cfg.mode not in {"offline", "paper", "testnet", "live"}:
+        raise ValueError("Поддерживаются только linear и известные режимы запуска")
+    for name in ["risk_pct", "daily_loss_pct"]:
+        if not D('0') < cfg.d(name) <= D('0.01'):
+            raise ValueError(f"{name}: допустимо больше нуля и не выше 1%")
+    if not D('0') < cfg.d('max_leverage') <= D('2'):
+        raise ValueError("max_leverage: допустимо больше нуля и не выше 2")
+    for name in ["entry_timeout_sec", "max_hold_sec", "queue_max", "max_requests_per_sec",
+                 "ema_fast", "ema_slow", "atr_period", "min_1m_bars", "max_consecutive_losses"]:
+        if not isinstance(getattr(cfg, name), int) or getattr(cfg, name) <= 0:
+            raise ValueError(f"{name}: требуется положительное целое число")
+    for name in ["tick_size", "qty_step", "min_qty", "offline_equity", "reward_multiple"]:
+        if not cfg.d(name).is_finite() or cfg.d(name) <= 0:
+            raise ValueError(f"{name}: требуется конечное положительное число")
+    if not D('0') < cfg.d('train_ratio') < D('1'):
+        raise ValueError("train_ratio должен лежать между 0 и 1")
+    return cfg

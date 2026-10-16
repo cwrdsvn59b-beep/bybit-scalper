@@ -70,9 +70,9 @@ def closed_5m(bars: list[Candle]) -> list[Candle]:
     out: list[Candle] = []
     for bucket in sorted(groups):
         group = sorted(groups[bucket], key=lambda x: x.ts)
-        if len(group) < 5:
+        expected = [bucket * 300_000 + n * 60_000 for n in range(5)]
+        if [bar.ts for bar in group] != expected:
             continue
-        group = group[:5]
         out.append(
             Candle(
                 ts=group[0].ts,

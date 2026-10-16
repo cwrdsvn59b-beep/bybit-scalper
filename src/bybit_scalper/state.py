@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import os
 from decimal import Decimal
 from pathlib import Path
+from contextlib import contextmanager
 
 from bybit_scalper.decimals import D
 from bybit_scalper.types import ClosedTrade, OrderStatus, OrderView, Position, Side
@@ -12,7 +14,31 @@ from bybit_scalper.types import ClosedTrade, OrderStatus, OrderView, Position, S
 class StateStore:
     def __init__(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self._lock_fd = None
+        if path != ':memory:':
+            self._lock_fd = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    if os.fstat(self._lock_fd).st_size == 0:
+                        os.write(self._lock_fd, b'0')
+                    os.lseek(self._lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._lock_fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+                raise RuntimeError('Эту базу уже использует другой процесс бота') from exc
+        try:
+            self.conn = sqlite3.connect(path)
+        except BaseException:
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+            raise
+        self._transaction_depth = 0
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init()
 
@@ -58,17 +84,51 @@ class StateStore:
             );
             """
         )
-        self.conn.commit()
+        self._commit()
 
     def close(self) -> None:
         self.conn.close()
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    def _commit(self) -> None:
+        if self._transaction_depth == 0:
+            self.conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        outer = self._transaction_depth == 0
+        if outer:
+            self.conn.execute("BEGIN IMMEDIATE")
+        self._transaction_depth += 1
+        try:
+            yield
+        except BaseException:
+            if outer:
+                self.conn.rollback()
+            raise
+        else:
+            if outer:
+                self.conn.commit()
+        finally:
+            self._transaction_depth -= 1
+
+    def bind_identity(self, mode: str, symbol: str, account_fingerprint: str) -> None:
+        identity = json.dumps([mode, symbol, account_fingerprint])
+        saved = self.get_kv("identity")
+        if saved and saved != identity:
+            raise RuntimeError("База состояния относится к другому режиму, инструменту или аккаунту.")
+        if not saved and (self.load_position().is_open() or self.load_order() is not None):
+            raise RuntimeError("Старая база без идентификатора: нужна ручная сверка перед использованием.")
+        self.set_kv("identity", identity)
 
     def add_exec(self, exec_id: str, link_id: str, qty: Decimal, price: Decimal, fee: Decimal, side: str, ts: int) -> bool:
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO execs (exec_id, link_id, qty, price, fee, side, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (exec_id, link_id, str(qty), str(price), str(fee), side, ts),
         )
-        self.conn.commit()
+        self._commit()
         return cur.rowcount == 1
 
     def save_order(self, order: OrderView | None) -> None:
@@ -89,7 +149,7 @@ class StateStore:
                 }
             )
             self.conn.execute("INSERT INTO orders (link_id, payload) VALUES (?, ?)", (order.link_id, payload))
-        self.conn.commit()
+        self._commit()
 
     def load_order(self) -> OrderView | None:
         row = self.conn.execute("SELECT payload FROM orders").fetchone()
@@ -126,7 +186,7 @@ class StateStore:
             "INSERT INTO position (id, payload) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
             (payload,),
         )
-        self.conn.commit()
+        self._commit()
 
     def load_position(self) -> Position:
         row = self.conn.execute("SELECT payload FROM position WHERE id = 1").fetchone()
@@ -154,7 +214,7 @@ class StateStore:
                 "INSERT INTO daily (day, start_equity, realized, consec_losses, pause_until) VALUES (?, ?, '0', 0, 0)",
                 (day, str(equity)),
             )
-            self.conn.commit()
+            self._commit()
             return {"start_equity": equity, "realized": Decimal("0"), "consec_losses": 0, "pause_until": 0}
         return {
             "start_equity": D(row[0]),
@@ -168,7 +228,7 @@ class StateStore:
             "UPDATE daily SET realized = ?, consec_losses = ?, pause_until = ? WHERE day = ?",
             (str(realized), consec_losses, pause_until, day),
         )
-        self.conn.commit()
+        self._commit()
 
     def add_trade(self, trade: ClosedTrade) -> None:
         self.conn.execute(
@@ -185,7 +245,7 @@ class StateStore:
                 trade.reason,
             ),
         )
-        self.conn.commit()
+        self._commit()
 
     def trades(self) -> list[ClosedTrade]:
         rows = self.conn.execute(
@@ -211,7 +271,7 @@ class StateStore:
             "INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             (key, value),
         )
-        self.conn.commit()
+        self._commit()
 
     def get_kv(self, key: str, default: str = "") -> str:
         row = self.conn.execute("SELECT v FROM kv WHERE k = ?", (key,)).fetchone()

@@ -6,7 +6,11 @@ from bybit_scalper.decimals import D
 
 
 class OrderBook:
-    """Снимок и дельта стакана Bybit V5. Дыра в update id делает книгу недействительной."""
+    """Bybit V5 snapshot/delta. Update IDs increase but need not be consecutive.
+
+    Transport loss/overflow must reset the book and resubscribe for a new snapshot.
+    Neither u nor seq documents a +1 continuity guarantee.
+    """
 
     def __init__(self) -> None:
         self.bids: dict[Decimal, Decimal] = {}
@@ -45,10 +49,6 @@ class OrderBook:
                 self.reset_needed = True
                 return
             if update_id <= self.last_u:
-                return
-            if update_id != self.last_u + 1:
-                self.valid = False
-                self.reset_needed = True
                 return
             self._apply_levels(data, delete_zero=True)
             self.last_u = update_id
