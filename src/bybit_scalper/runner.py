@@ -14,8 +14,9 @@ from bybit_scalper.book import OrderBook
 from bybit_scalper.config import Settings
 from bybit_scalper.decimals import D
 from bybit_scalper.engine import Engine
+from bybit_scalper.live_gate import live_blockers
 from bybit_scalper.paper import PaperExchange
-from bybit_scalper.report import format_report, summarize
+from bybit_scalper.report import curve_drawdown, format_report, summarize
 from bybit_scalper.state import StateStore, account_lease
 from bybit_scalper.synthetic import build_long_fixture, candles_from_csv, candles_to_csv
 from bybit_scalper.types import BlockReason, BookTop, Candle, MarketState, OrderStatus
@@ -469,6 +470,29 @@ def _stream_loop_impl(cfg: Settings, private: bool, prepared_broker=None) -> Non
             raise SystemExit("Обнаружены неизвестные входные заявки. Нужна ручная сверка субсчёта.")
         engine.on_reconnect()
     engine.note_clock(int(time.time() * 1000), server_ms)
+    if cfg.mode == "live":
+        reasons = live_blockers(
+            cfg,
+            margin_verified=engine.margin_verified,
+            margin_mode=engine.margin_mode,
+            leverage=engine.account_leverage,
+            equity=engine.verified_equity,
+            available=engine.available,
+            funding_ok=engine.funding_ledger_confirmed,
+            clock_skew_ms=engine.clock_skew_ms,
+            position_open=engine.position.is_open(),
+        )
+        if reasons:
+            engine.live_ready = False
+            text = "Live не готов:\n- " + "\n- ".join(reasons)
+            if engine.position.is_open() or (engine.order is not None and engine.order.active):
+                log.error("%s Открытое состояние остаётся под сопровождением, новые входы закрыты.", text)
+            else:
+                store.close()
+                raise SystemExit(text)
+        else:
+            engine.live_ready = True
+            log.info("Проверка формы субсчёта пройдена. Ожидание стратегии этим не доказано.")
     messages: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
     private_messages = PrivateQueue(cfg.queue_max)
     overflow = [False]
@@ -852,6 +876,7 @@ def format_saved_report(cfg: Settings) -> str:
         submitted = int(store.get_kv("submitted", "0"))
         filled = int(store.get_kv("filled_entries", "0"))
         funding = store.sum_cashflow("funding", 0, 10**15)
+        funding_events = store.cashflow_events("funding")
         synced = store.get_kv("cashflow_synced_ms", "не подтверждено")
     finally:
         store.close()
@@ -862,13 +887,17 @@ def format_saved_report(cfg: Settings) -> str:
         "журнал sqlite: " + cfg.mode,
         True,
         [
-            "Profit factor, ожидание и просадка относятся к закрытым сделкам без распределения funding.",
-            "Открытый PnL не включён; это не полная кривая капитала счёта.",
+            "Profit factor, ожидание и просадка ниже относятся только к закрытым сделкам.",
+            "Отдельная кривая добавляет уже записанный funding. Открытый PnL в неё не входит.",
+            "Это учёт, а не доказательство положительного ожидания.",
         ],
     )
+    curve_net, curve_dd = curve_drawdown([(trade.ts, trade.pnl) for trade in trades] + funding_events)
     return (
         format_report(report).replace("Чистый PnL:", "Торговый PnL без funding:", 1)
         + f"\nУчтённый funding: {funding}"
         + f"\nСумма торгового PnL и funding: {report.net_pnl + funding}"
+        + f"\nКривая сделок и funding, итог: {curve_net}"
+        + f"\nМакс. просадка кривой сделок и funding: {curve_dd}"
         + f"\nПоследняя синхронизация журнала, Unix ms: {synced}"
     )

@@ -100,6 +100,8 @@ class Engine:
         # Offline has no exchange funding clock. Other modes stay blocked until a sync succeeds.
         self.funding_ledger_confirmed = cfg.mode == "offline"
         self.next_funding_ms = 0
+        # Live stays disarmed until the dedicated-account gate passes. Fail closed.
+        self.live_ready = cfg.mode != "live"
 
     def recover(self, now_ms: int, equity: Decimal) -> None:
         self.now_ms = now_ms
@@ -376,6 +378,8 @@ class Engine:
             self.store.save_order(self.order)
 
     def _maybe_enter(self, market: MarketState) -> None:
+        if self.cfg.mode == "live" and not self.live_ready:
+            return
         if self.block != BlockReason.NONE or not self.connected:
             return
         if not self.cfg.symbol_allowed():
@@ -710,6 +714,8 @@ class Engine:
     def _funding_allows(self, now_ms: int) -> bool:
         if self.cfg.mode == "offline":
             return True
+        if self.cfg.mode == "live" and not self.funding_ledger_confirmed:
+            return False
         if self.next_funding_ms <= now_ms:
             return False
         crosses = funding_crosses(now_ms, self.cfg.max_hold_sec * 1000, self.next_funding_ms)

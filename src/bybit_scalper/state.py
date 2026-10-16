@@ -210,6 +210,13 @@ class StateStore:
             total += D(cash)
         return total
 
+    def cashflow_events(self, kind: str) -> list[tuple[int, Decimal]]:
+        rows = self.conn.execute(
+            "SELECT ts, cash FROM cashflows WHERE kind = ? ORDER BY ts, external_id",
+            (kind,),
+        ).fetchall()
+        return [(int(ts), D(cash)) for ts, cash in rows]
+
     def replace_cashflow_window(self, start_ms: int, end_ms: int, records: list[tuple]) -> None:
         """Atomically repair a fully fetched funding interval using transaction-log only.
 
