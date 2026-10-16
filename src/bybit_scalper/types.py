@@ -206,3 +206,13 @@ class Report:
     slippage: Decimal
     preliminary: bool
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AccountView:
+    equity: Decimal
+    available: Decimal
+    margin_mode: str
+    leverage: Decimal
+    verified: bool
+

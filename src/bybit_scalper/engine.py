@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from copy import deepcopy
 from collections import deque
 from datetime import datetime, timezone
@@ -9,8 +10,7 @@ from decimal import Decimal
 
 from bybit_scalper.config import Settings
 from bybit_scalper.decimals import D
-from bybit_scalper.risk import build_plan
-from bybit_scalper.risk import new_link_id
+from bybit_scalper.risk import build_plan, funding_crosses, new_link_id
 from bybit_scalper.signals import evaluate
 from bybit_scalper.state import StateStore
 from bybit_scalper.types import (
@@ -83,6 +83,25 @@ class Engine:
         self._reconciling = False
         self.day_pnl_baseline = Decimal("0")
         self._trade_flow: deque[tuple[int, Decimal, str]] = deque()
+        allocated = cfg.d("allocated_capital")
+        if cfg.mode in {"offline", "paper"}:
+            # Simulator assumption: no exchange margin call. Not a verified UNIFIED balance.
+            self.margin_verified = True
+            self.available = allocated
+            self.verified_equity = cfg.d("offline_equity")
+            self.margin_mode = "simulator"
+            self.account_leverage = cfg.d("max_leverage")
+        else:
+            self.margin_verified = False
+            self.available = Decimal("0")
+            self.verified_equity = Decimal("0")
+            self.margin_mode = ""
+            self.account_leverage = Decimal("0")
+        # Offline has no exchange funding clock. Other modes stay blocked until a sync succeeds.
+        self.funding_ledger_confirmed = cfg.mode == "offline"
+        self.next_funding_ms = 0
+        # Live stays disarmed until the dedicated-account gate passes. Fail closed.
+        self.live_ready = cfg.mode != "live"
 
     def recover(self, now_ms: int, equity: Decimal) -> None:
         self.now_ms = now_ms
@@ -133,6 +152,7 @@ class Engine:
     def on_market(self, market: MarketState) -> None:
         self.now_ms = market.now_ms
         self.mark = market.mark
+        self.next_funding_ms = market.next_funding_ms
         while self._reqs and market.now_ms - self._reqs[0] >= 1000:
             self._reqs.popleft()
         self.rate_limited = len(self._reqs) > self.cfg.max_requests_per_sec
@@ -177,8 +197,10 @@ class Engine:
         if simulate_fill and hasattr(self.exchange, "match_trade"):
             self.exchange.server_ms = self.now_ms
             self._expire_entry(self.now_ms)
-            for ex in self.exchange.match_trade(price, qty, taker_side=taker_side):
-                self.on_exec(ex)
+            # A print from before the order existed is not a fill.
+            if not (self.order is not None and ts and ts < self.order.opened_ms):
+                for ex in self.exchange.match_trade(price, qty, taker_side=taker_side):
+                    self.on_exec(ex)
             self._paper_protection(price, ts)
 
     def on_exec(self, ex: Exec) -> bool:
@@ -199,6 +221,15 @@ class Engine:
             self.__dict__.update(before)
             raise
         if self._reconciling:
+            return True
+        late_entry = (
+            not ex.reduce_only
+            and bool(self.pending_exit)
+            and self.order is not None
+            and ex.link_id == self.order.link_id
+        )
+        if late_entry:
+            self._block(BlockReason.UNKNOWN_POSITION, "late entry fill while exit is in flight")
             return True
         if self.position.is_open():
             if self.exit_requested and not self.pending_exit:
@@ -347,6 +378,8 @@ class Engine:
             self.store.save_order(self.order)
 
     def _maybe_enter(self, market: MarketState) -> None:
+        if self.cfg.mode == "live" and not self.live_ready:
+            return
         if self.block != BlockReason.NONE or not self.connected:
             return
         if not self.cfg.symbol_allowed():
@@ -362,6 +395,11 @@ class Engine:
         bar_ts = market.bars[-1].ts
         if bar_ts == self.last_attempt_bar or len(market.bars) < self.cfg.min_1m_bars:
             return
+        if not self._funding_allows(market.now_ms):
+            return
+        budget = self._budget()
+        if budget is None:
+            return
         self.last_attempt_bar = bar_ts
         decision = evaluate(market.bars, self.cfg)
         if not decision.accepted or decision.signal is None:
@@ -375,6 +413,19 @@ class Engine:
                 return
         self.signal_count += 1
         self.audit.append((bar_ts, "signal"))
+        if self.cfg.mode in {"testnet", "live"}:
+            preflight_started = time.monotonic()
+            try:
+                self.apply_account(self.exchange.read_account())
+            except Exception:
+                self.margin_verified = False
+                return
+            budget = self._budget()
+            if budget is None:
+                return
+            after_preflight = market.now_ms + int((time.monotonic() - preflight_started) * 1000)
+            if after_preflight - market.book.ts > self.cfg.stale_book_ms or not self._funding_allows(after_preflight):
+                return
         plan = build_plan(
             decision.signal,
             market.book.bid,
@@ -382,7 +433,7 @@ class Engine:
             market.book.bid_qty,
             market.book.ask_qty,
             market.book.valid,
-            market.equity,
+            budget,
             self.fees,
             self.instrument,
             self.cfg,
@@ -392,6 +443,9 @@ class Engine:
         )
         if not plan.ok:
             log.info("пропуск: %s", plan.reason)
+            return
+        if not self._margin_fits(plan):
+            log.info("пропуск: доступная маржа не покрывает позицию и резерв")
             return
         self.submit(plan)
 
@@ -462,6 +516,7 @@ class Engine:
             new_qty = self.position.qty + ex.qty
             self.position.avg = (self.position.avg * self.position.qty + ex.price * ex.qty) / new_qty
             self.position.qty = new_qty
+            self.position.stop_confirmed = False
             self.open_fees += ex.fee
         if self.order is not None and ex.link_id == self.order.link_id:
             before = self.order.filled
@@ -622,7 +677,7 @@ class Engine:
                 self._block(BlockReason.STALE, "no current price for daily risk")
                 return
             mark = self.position.avg
-        limit = -self.start_equity * self.cfg.d("daily_loss_pct")
+        limit = -self.cfg.d("allocated_capital") * self.cfg.d("daily_loss_pct")
         if self._equity_pnl(mark) <= limit or self.store.get_kv("daily_stop_day") == self.day:
             self.store.set_kv("daily_stop_day", self.day)
             self._block(BlockReason.DAILY, "daily_loss")
@@ -631,13 +686,61 @@ class Engine:
                 self._flatten(mark)
 
     def _equity_pnl(self, mark: Decimal) -> Decimal:
+        funding = self._funding_today()
         if not self.position.is_open():
-            return self.realized - self.day_pnl_baseline
+            return self.realized + funding - self.day_pnl_baseline
         gross = (mark - self.position.avg) * self.position.qty
         if self.position.side is Side.SHORT:
             gross = -gross
         exit_fee = self.position.qty * mark * self.fees.taker
-        return self.realized + gross - self.open_fees - exit_fee - self.day_pnl_baseline
+        return self.realized + funding + gross - self.open_fees - exit_fee - self.day_pnl_baseline
+
+    def _funding_today(self) -> Decimal:
+        if not self.day:
+            return Decimal("0")
+        start = int(
+            datetime.strptime(self.day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000
+        )
+        return self.store.sum_cashflow("funding", start, start + 86_400_000)
+
+    def _budget(self) -> Decimal | None:
+        if not self.margin_verified:
+            return None
+        allocated = self.cfg.d("allocated_capital")
+        if allocated <= 0 or self.verified_equity <= 0:
+            return None
+        return min(allocated, self.verified_equity)
+
+    def _funding_allows(self, now_ms: int) -> bool:
+        if self.cfg.mode == "offline":
+            return True
+        if self.cfg.mode == "live" and not self.funding_ledger_confirmed:
+            return False
+        if self.next_funding_ms <= now_ms:
+            return False
+        crosses = funding_crosses(now_ms, self.cfg.max_hold_sec * 1000, self.next_funding_ms)
+        if crosses and not self.funding_ledger_confirmed:
+            return False
+        return True
+
+    def _margin_fits(self, plan: Plan) -> bool:
+        if not plan.ok or plan.entry is None or plan.qty is None or not self.margin_verified:
+            return False
+        leverage = self.account_leverage if self.account_leverage > 0 else self.cfg.d("max_leverage")
+        if leverage <= 0:
+            return False
+        notional = plan.entry * plan.qty
+        reserve = self.cfg.d("slippage_bps") + self.cfg.d("adverse_reserve_bps")
+        need = notional / leverage + notional * (self.fees.taker * 2 + reserve / D("10000"))
+        budget = self._budget()
+        return budget is not None and need <= min(self.available, budget)
+
+    def apply_account(self, view) -> None:
+        self.verified_equity = view.equity
+        self.available = view.available
+        self.margin_mode = view.margin_mode
+        self.account_leverage = view.leverage
+        self.margin_verified = bool(view.verified and view.equity > 0)
 
     def _ensure_day(self, now_ms: int, equity: Decimal) -> None:
         day = utc_day(now_ms)
@@ -655,7 +758,10 @@ class Engine:
         else:
             self.day_pnl_baseline = Decimal("0")
             if new_day and self.position.is_open():
-                self.day_pnl_baseline = self._equity_pnl(self.mark or self.position.avg)
+                mark = self.mark if self.mark > 0 else self.position.avg
+                # The day key is already the new UTC date, so _equity_pnl sees only new-day funding.
+                # Leave that funding out of the baseline or a 00:00 settlement vanishes from the day.
+                self.day_pnl_baseline = self._equity_pnl(mark) - self._funding_today()
             self.store.set_kv(key, str(self.day_pnl_baseline))
         if new_day and self.block == BlockReason.DAILY:
             self._clear_block()

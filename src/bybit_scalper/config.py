@@ -52,6 +52,8 @@ class Settings:
     taker_fee: object
     trade_flow_enabled: bool
     offline_equity: object
+    allocated_capital: object
+    adverse_reserve_bps: object
     tick_size: object
     qty_step: object
     min_qty: object
@@ -111,4 +113,17 @@ def load_settings(path: str | Path, mode: str | None = None) -> Settings:
             raise ValueError(f"{name}: требуется конечное положительное число")
     if not D('0') < cfg.d('train_ratio') < D('1'):
         raise ValueError("train_ratio должен лежать между 0 и 1")
+    if not cfg.d("allocated_capital").is_finite() or cfg.d("allocated_capital") <= 0:
+        raise ValueError("allocated_capital: требуется конечное положительное число")
+    if not cfg.d("adverse_reserve_bps").is_finite() or cfg.d("adverse_reserve_bps") < 0:
+        raise ValueError("adverse_reserve_bps: требуется конечное неотрицательное число")
+    if cfg.mode in {"offline", "paper"} and cfg.d("allocated_capital") > cfg.d("offline_equity"):
+        raise ValueError("В offline и paper выделенный капитал не может быть больше offline_equity")
+    if cfg.mode == "live" and _uses_paper_database(cfg.state_db):
+        raise ValueError("Режим live не может использовать paper-базу data/state.db")
     return cfg
+
+
+def _uses_paper_database(path: str) -> bool:
+    norm = os.path.normpath(path).replace("\\", "/")
+    return norm == "data/state.db" or norm.endswith("/data/state.db")

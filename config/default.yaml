@@ -42,6 +42,10 @@ maker_fee: "0.00020"
 taker_fee: "0.00055"
 trade_flow_enabled: false
 
+# Выделенный капитал бота. Не равен автоматически всему UNIFIED equity.
+allocated_capital: "10000"
+adverse_reserve_bps: "2.0"
+
 # Offline/paper, если биржа не ответила ставками.
 offline_equity: "10000"
 tick_size: "0.1"

@@ -75,3 +75,18 @@ def format_report(report: Report) -> str:
     for note in report.notes:
         lines.append(f"- {note}")
     return "\n".join(lines)
+
+
+def curve_drawdown(events: list[tuple[int, Decimal]]) -> tuple[Decimal, Decimal]:
+    """Net and max drawdown of a time-ordered cash series. Not a proof of edge."""
+    equity = Decimal("0")
+    peak = Decimal("0")
+    max_dd = Decimal("0")
+    for _ts, amount in sorted(events, key=lambda item: (item[0], item[1])):
+        equity += amount
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_dd:
+            max_dd = drawdown
+    return equity, max_dd

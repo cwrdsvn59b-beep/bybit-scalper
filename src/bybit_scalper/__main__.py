@@ -7,7 +7,15 @@ from pathlib import Path
 
 from bybit_scalper.config import load_settings
 from bybit_scalper.logging_setup import register_secret, setup_logging
-from bybit_scalper.runner import format_saved_report, run_live, run_offline, run_paper, run_testnet
+from bybit_scalper.runner import (
+    collect_market,
+    format_saved_report,
+    replay_market,
+    run_live,
+    run_offline,
+    run_paper,
+    run_testnet,
+)
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -33,8 +41,10 @@ def main(argv: list[str] | None = None) -> int:
         ("offline", "config/default.yaml"),
         ("paper", "config/default.yaml"),
         ("testnet", "config/testnet.yaml"),
-        ("live", "config/default.yaml"),
+        ("live", "config/live.yaml"),
         ("report", "config/default.yaml"),
+        ("collect", "config/default.yaml"),
+        ("replay", "config/default.yaml"),
     ):
         item = sub.add_parser(name)
         item.add_argument("--config", default=default)
@@ -47,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         print("Нужны BYBIT_API_KEY и BYBIT_API_SECRET. В файлы проекта их записывать нельзя.")
         return 2
-    mode = None if args.cmd == "report" else args.cmd
+    mode = None if args.cmd in {"report", "collect", "replay"} else args.cmd
     cfg = load_settings(args.config, mode=mode)
     if args.cmd == "offline":
         print(run_offline(cfg))
@@ -60,6 +70,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "live":
         run_live(cfg)
+        return 0
+    if args.cmd == "collect":
+        try:
+            print(collect_market(cfg))
+        except SystemExit as exc:
+            print(exc)
+            return 1
+        return 0
+    if args.cmd == "replay":
+        print(replay_market(cfg))
         return 0
     print(format_saved_report(cfg))
     return 0

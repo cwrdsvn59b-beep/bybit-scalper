@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import os
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 from contextlib import contextmanager
@@ -11,8 +12,28 @@ from bybit_scalper.decimals import D
 from bybit_scalper.types import ClosedTrade, OrderStatus, OrderView, Position, Side
 
 
+@contextmanager
+def account_lease(environment: str, user_id: str):
+    """One process per authenticated UID/environment on this host, across state paths/keys.
+
+    This is a local OS lock, not a distributed lease across different machines/users.
+    """
+    root = Path(os.environ.get("BYBIT_LOCK_DIR", str(Path.home() / ".bybit_scalper" / "leases")))
+    scope = hashlib.sha256((environment + ":" + user_id).encode()).hexdigest()
+    lease = StateStore(str(root / (scope + ".db")))
+    try:
+        yield
+    finally:
+        lease.close()
+
+
 class StateStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, readonly: bool = False) -> None:
+        if readonly:
+            self._lock_fd = None
+            self._transaction_depth = 0
+            self.conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+            return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock_fd = None
         if path != ':memory:':
@@ -82,6 +103,19 @@ class StateStore:
                 slippage TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cashflows (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                cash TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                PRIMARY KEY (source, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS cashflow_aliases (
+                alias TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL
+            );
             """
         )
         self._commit()
@@ -130,6 +164,80 @@ class StateStore:
         )
         self._commit()
         return cur.rowcount == 1
+
+    def add_cashflow(
+        self,
+        source: str,
+        external_id: str,
+        kind: str,
+        cash: Decimal,
+        ts: int,
+        aliases: list[str],
+    ) -> bool:
+        """False if any alias is already stored. That blocks execution/log double counting."""
+        keys: list[str] = []
+        for alias in [external_id, *aliases]:
+            if alias and alias not in keys:
+                keys.append(alias)
+        if not external_id or not keys:
+            return False
+        for alias in keys:
+            found = self.conn.execute(
+                "SELECT 1 FROM cashflow_aliases WHERE alias = ?",
+                (alias,),
+            ).fetchone()
+            if found:
+                return False
+        self.conn.execute(
+            "INSERT INTO cashflows (source, external_id, kind, cash, ts) VALUES (?, ?, ?, ?, ?)",
+            (source, external_id, kind, str(cash), int(ts)),
+        )
+        for alias in keys:
+            self.conn.execute(
+                "INSERT INTO cashflow_aliases (alias, source, external_id) VALUES (?, ?, ?)",
+                (alias, source, external_id),
+            )
+        self._commit()
+        return True
+
+    def sum_cashflow(self, kind: str, start_ms: int, end_ms: int) -> Decimal:
+        rows = self.conn.execute(
+            "SELECT cash FROM cashflows WHERE kind = ? AND ts >= ? AND ts < ?",
+            (kind, int(start_ms), int(end_ms)),
+        ).fetchall()
+        total = Decimal("0")
+        for (cash,) in rows:
+            total += D(cash)
+        return total
+
+    def cashflow_events(self, kind: str) -> list[tuple[int, Decimal]]:
+        rows = self.conn.execute(
+            "SELECT ts, cash FROM cashflows WHERE kind = ? ORDER BY ts, external_id",
+            (kind,),
+        ).fetchall()
+        return [(int(ts), D(cash)) for ts, cash in rows]
+
+    def replace_cashflow_window(self, start_ms: int, end_ms: int, records: list[tuple]) -> None:
+        """Atomically repair a fully fetched funding interval using transaction-log only.
+
+        Funding execId and transaction tradeId are not documented as a cross-source key.
+        Legacy execution/transaction rows in the covered interval are replaced, not added.
+        Trades, daily limits and records outside the covered interval are preserved.
+        """
+        with self.transaction():
+            self.conn.execute(
+                "DELETE FROM cashflow_aliases WHERE (source, external_id) IN "
+                "(SELECT source, external_id FROM cashflows WHERE kind = 'funding' AND ts >= ? AND ts < ?)",
+                (start_ms, end_ms),
+            )
+            self.conn.execute(
+                "DELETE FROM cashflows WHERE kind = 'funding' AND ts >= ? AND ts < ?",
+                (start_ms, end_ms),
+            )
+            for kind, external, cash, ts, _aliases in records:
+                # A single authoritative source makes cross-source ID guesses unnecessary.
+                self.add_cashflow("transaction", external, kind, cash, ts, [external])
+            self.set_kv("cashflow_synced_ms", str(end_ms - 1))
 
     def save_order(self, order: OrderView | None) -> None:
         self.conn.execute("DELETE FROM orders")

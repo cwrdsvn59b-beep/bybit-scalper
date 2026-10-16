@@ -15,6 +15,7 @@ def test_private_reconciliation_runs_while_market_queue_never_empties(cfg, tmp_p
     cfg.mode, cfg.testnet, cfg.state_db = 'testnet', True, str(tmp_path / 'runtime.db')
     monkeypatch.setenv('BYBIT_API_KEY', 'not-a-real-key')
     monkeypatch.setenv('BYBIT_API_SECRET', 'not-a-real-secret')
+    monkeypatch.setenv('BYBIT_LOCK_DIR', str(tmp_path / 'account-locks'))
     monkeypatch.setattr(runner.time, 'time', lambda: clock[0])
     monkeypatch.setattr(runner, '_fetch_public_klines', lambda *args: list(bars))
     monkeypatch.setattr(runner, '_public_http', lambda *args: object())
@@ -24,6 +25,8 @@ def test_private_reconciliation_runs_while_market_queue_never_empties(cfg, tmp_p
             super().__init__(instrument, cfg.fallback_fees(), D('0'), D('0'))
         def load_context(self):
             return self.instrument, self.fees, D('10000'), int(clock[0] * 1000)
+        def account_identity(self):
+            return '12345'
         def open_entry_orders(self):
             return []
         def account_equity(self):

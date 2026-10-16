@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import hashlib
+from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,9 +14,10 @@ from bybit_scalper.book import OrderBook
 from bybit_scalper.config import Settings
 from bybit_scalper.decimals import D
 from bybit_scalper.engine import Engine
+from bybit_scalper.live_gate import live_blockers
 from bybit_scalper.paper import PaperExchange
-from bybit_scalper.report import format_report, summarize
-from bybit_scalper.state import StateStore
+from bybit_scalper.report import curve_drawdown, format_report, summarize
+from bybit_scalper.state import StateStore, account_lease
 from bybit_scalper.synthetic import build_long_fixture, candles_from_csv, candles_to_csv
 from bybit_scalper.types import BlockReason, BookTop, Candle, MarketState, OrderStatus
 
@@ -56,6 +58,47 @@ def parse_trades(message: dict) -> list[tuple[Decimal, Decimal, int, str]]:
     for row in message.get("data") or []:
         prints.append((D(row["p"]), D(row["v"]), int(row["T"]), str(row["S"])))
     return prints
+
+
+class PrivateQueue:
+    """Private executions are not evicted to make room for quotes.
+
+    A full private buffer drops the new event and counts it. The loop then blocks entries.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self.maxsize = maxsize
+        self.dropped = 0
+        self._items: deque[str] = deque()
+
+    def put_nowait(self, item: str) -> None:
+        if len(self._items) >= self.maxsize:
+            self.dropped += 1
+            return
+        self._items.append(item)
+
+    def get_nowait(self) -> str:
+        if not self._items:
+            raise queue.Empty
+        return self._items.popleft()
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+
+def take_private_then_public(private_q: PrivateQueue, public_q: queue.Queue, timeout: float):
+    """Drain every queued private event, then take at most one public message."""
+    private_batch: list[str] = []
+    while True:
+        try:
+            private_batch.append(private_q.get_nowait())
+        except queue.Empty:
+            break
+    try:
+        public_item = public_q.get(timeout=timeout)
+    except queue.Empty:
+        public_item = None
+    return private_batch, public_item
 
 
 def upsert_candle(bars: list[Candle], candle: Candle) -> None:
@@ -255,6 +298,9 @@ def _notes(cfg: Settings, count: int) -> str:
             "- Комиссии offline: maker 0.020%, taker 0.055%, пока API не подменит их.",
             "- В риск входа заложена taker-комиссия, даже если фактический отдых в стакане был бы maker.",
             f"- Поток сделок в конфиге: {'включён' if cfg.trade_flow_enabled else 'выключен'}.",
+            f"- Выделенный капитал: {cfg.d('allocated_capital')}. Это не весь UNIFIED equity.",
+            "- Offline не имеет биржевых часов funding, поэтому next_funding=0 вход не блокирует.",
+            "- Paper, testnet и live без подтверждённого времени funding новые входы не ставят.",
         ]
     )
 
@@ -325,6 +371,24 @@ def run_live(cfg: Settings) -> None:
 
 
 def _stream_loop(cfg: Settings, private: bool) -> None:
+    if not private:
+        return _stream_loop_impl(cfg, private=False)
+    import os
+
+    from bybit_scalper.exchange import PybitBroker
+
+    key = os.environ.get("BYBIT_API_KEY", "")
+    secret = os.environ.get("BYBIT_API_SECRET", "")
+    if not key or not secret:
+        raise SystemExit("Нет BYBIT_API_KEY или BYBIT_API_SECRET.")
+    broker = PybitBroker(cfg, key, secret, cfg.instrument())
+    uid = broker.account_identity()
+    environment = "testnet" if cfg.testnet else ("demo" if cfg.demo else "mainnet")
+    with account_lease(environment, uid):
+        return _stream_loop_impl(cfg, private=True, prepared_broker=broker)
+
+
+def _stream_loop_impl(cfg: Settings, private: bool, prepared_broker=None) -> None:
     if not cfg.symbol_allowed():
         raise SystemExit(
             "Символ не разрешён. ETHUSDT включается только после отдельной проверки, eth_enabled: true."
@@ -356,7 +420,7 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
     equity = cfg.d("offline_equity")
     broker: PaperExchange | PybitBroker
     if private:
-        broker = PybitBroker(cfg, key, secret, instrument)
+        broker = prepared_broker or PybitBroker(cfg, key, secret, instrument)
         instrument, fees, equity, server_ms = broker.load_context()
         log.info("комиссии API maker=%s taker=%s источник=%s", fees.maker, fees.taker, fees.source)
         log.info("капитал UNIFIED %s, сервер %s", equity, server_ms)
@@ -381,6 +445,14 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
     if not private:
         broker.position = store.load_position()
     engine.recover(int(time.time() * 1000), equity)
+    if private and hasattr(broker, "read_account"):
+        try:
+            engine.apply_account(broker.read_account())
+        except Exception as exc:
+            engine.margin_verified = False
+            log.warning("маржа не подтверждена, новые входы закрыты: %s", exc)
+    if private and hasattr(broker, "sync_cashflows"):
+        engine.funding_ledger_confirmed = bool(broker.sync_cashflows(store))
     if not private:
         trades = store.trades()
         broker.realized = sum((t.pnl + t.fees for t in trades), D('0')) + engine.round_pnl + engine.round_fees
@@ -398,14 +470,38 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
             raise SystemExit("Обнаружены неизвестные входные заявки. Нужна ручная сверка субсчёта.")
         engine.on_reconnect()
     engine.note_clock(int(time.time() * 1000), server_ms)
+    if cfg.mode == "live":
+        reasons = live_blockers(
+            cfg,
+            margin_verified=engine.margin_verified,
+            margin_mode=engine.margin_mode,
+            leverage=engine.account_leverage,
+            equity=engine.verified_equity,
+            available=engine.available,
+            funding_ok=engine.funding_ledger_confirmed,
+            clock_skew_ms=engine.clock_skew_ms,
+            position_open=engine.position.is_open(),
+        )
+        if reasons:
+            engine.live_ready = False
+            text = "Live не готов:\n- " + "\n- ".join(reasons)
+            if engine.position.is_open() or (engine.order is not None and engine.order.active):
+                log.error("%s Открытое состояние остаётся под сопровождением, новые входы закрыты.", text)
+            else:
+                store.close()
+                raise SystemExit(text)
+        else:
+            engine.live_ready = True
+            log.info("Проверка формы субсчёта пройдена. Ожидание стратегии этим не доказано.")
     messages: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
+    private_messages = PrivateQueue(cfg.queue_max)
     overflow = [False]
     stream = PublicStream(cfg, messages, overflow)
     stream.start()
     private_ws = None
     if private:
         try:
-            private_ws = _start_private(cfg, key, secret, messages, overflow)
+            private_ws = _start_private(cfg, key, secret, private_messages, overflow)
         except BaseException:
             stream.close()
             store.close()
@@ -451,11 +547,28 @@ def _stream_loop(cfg: Settings, private: bool) -> None:
             if now_wall - last_aux > 30:
                 last_aux = now_wall
                 funding_rate, next_funding = _refresh_public(market_http, cfg, engine, funding_rate, next_funding)
-                if private:
-                    equity = broker.account_equity()
-            try:
-                raw = messages.get(timeout=0.5)
-            except queue.Empty:
+                if private and hasattr(broker, "account_equity"):
+                    try:
+                        equity = broker.account_equity()
+                    except Exception:
+                        engine.margin_verified = False
+                if private and hasattr(broker, "read_account"):
+                    try:
+                        engine.apply_account(broker.read_account())
+                    except Exception:
+                        engine.margin_verified = False
+                if private and hasattr(broker, "sync_cashflows"):
+                    engine.funding_ledger_confirmed = bool(broker.sync_cashflows(store))
+            batch, raw = take_private_then_public(private_messages, messages, 0.5)
+            for item in batch:
+                try:
+                    private_message = json.loads(item)
+                except json.JSONDecodeError:
+                    continue
+                _dispatch_private(private_message, engine, broker if private else None, cfg)
+            if private_messages.dropped:
+                engine._block(BlockReason.UNKNOWN_POSITION, "private queue overflow")
+            if raw is None:
                 _mark_link(engine, stream, book, bars, equity, overflow, funding_rate, next_funding)
                 continue
             try:
@@ -636,13 +749,32 @@ def candles_contiguous(bars: list[Candle]) -> bool:
     return bool(bars) and all(right.ts - left.ts == 60_000 for left, right in zip(bars, bars[1:]))
 
 
-def _start_private(cfg: Settings, key: str, secret: str, messages: queue.Queue, overflow: list[bool]):
+def _dispatch_private(message: dict, engine: Engine, broker, cfg: Settings) -> None:
+    topic = str(message.get("topic") or "")
+    if topic == "execution" and broker is not None and hasattr(broker, "ingest_execution_message"):
+        for ex in broker.ingest_execution_message(message):
+            engine.on_exec(ex)
+        return
+    if topic == "order":
+        from bybit_scalper.exchange import map_order_status
+
+        for row in message.get("data") or []:
+            if row.get("symbol") != cfg.symbol:
+                continue
+            link = str(row.get("orderLinkId") or "")
+            if link:
+                engine.note_remote_status(link, map_order_status(row.get("orderStatus")))
+
+
+def _start_private(cfg: Settings, key: str, secret: str, messages, overflow: list[bool]):
     from pybit.unified_trading import WebSocket
 
     def callback(message) -> None:
+        payload = json.dumps(message) if not isinstance(message, str) else message
         try:
-            messages.put_nowait(json.dumps(message) if not isinstance(message, str) else message)
+            messages.put_nowait(payload)
         except queue.Full:
+            # queue.Queue only. PrivateQueue records its own drop and does not raise.
             overflow[0] = True
 
     ws = WebSocket(
@@ -658,21 +790,114 @@ def _start_private(cfg: Settings, key: str, secret: str, messages: queue.Queue, 
     return ws
 
 
+def collect_market(cfg: Settings, directory: str = "data/replay") -> str:
+    """Public klines and public trades. A network error is fatal: no synthetic tape is written."""
+    session = _public_http(cfg)
+    try:
+        bars = _fetch_public_klines(session, cfg)
+        trades = _fetch_public_trades(session, cfg)
+    except Exception as exc:
+        raise SystemExit(
+            "Сбор рыночных данных не выполнен, заглушка не создана. "
+            f"Причина: {exc}"
+        ) from exc
+    if not bars:
+        raise SystemExit("Публичные свечи не получены. Файл не создан.")
+    out = Path(directory)
+    out.mkdir(parents=True, exist_ok=True)
+    kline_path = out / f"{cfg.symbol}_klines.json"
+    trade_path = out / f"{cfg.symbol}_trades.json"
+    kline_path.write_text(
+        json.dumps(
+            [
+                {"ts": bar.ts, "o": str(bar.o), "h": str(bar.h), "l": str(bar.l), "c": str(bar.c), "v": str(bar.v)}
+                for bar in bars
+            ]
+        ),
+        encoding="utf-8",
+    )
+    trade_path.write_text(json.dumps(trades), encoding="utf-8")
+    return (
+        f"Собрано свечей: {len(bars)}, публичных сделок: {len(trades)}. "
+        f"Файлы: {kline_path}, {trade_path}. Это не отчёт доходности."
+    )
+
+
+def _fetch_public_trades(session, cfg: Settings) -> list[dict]:
+    resp = session.get_public_trade_history(category=cfg.category, symbol=cfg.symbol, limit=1000)
+    rows = (resp.get("result") or {}).get("list") or []
+    trades = []
+    for row in rows:
+        trades.append(
+            {
+                "p": str(row.get("price") or row.get("p") or ""),
+                "v": str(row.get("size") or row.get("v") or ""),
+                "T": int(row.get("time") or row.get("T") or 0),
+                "S": str(row.get("side") or row.get("S") or ""),
+            }
+        )
+    return trades
+
+
+def replay_market(cfg: Settings, directory: str = "data/replay") -> str:
+    directory_path = Path(directory)
+    kline_path = directory_path / f"{cfg.symbol}_klines.json"
+    trade_path = directory_path / f"{cfg.symbol}_trades.json"
+    if not kline_path.exists() or not trade_path.exists():
+        return (
+            "Лента не собрана. Статистика не выдумана. "
+            "Сначала команда collect на машине с доступом к публичному API Bybit."
+        )
+    raw_bars = json.loads(kline_path.read_text(encoding="utf-8"))
+    raw_trades = json.loads(trade_path.read_text(encoding="utf-8"))
+    bars = [
+        Candle(ts=int(row["ts"]), o=D(row["o"]), h=D(row["h"]), l=D(row["l"]), c=D(row["c"]), v=D(row["v"]))
+        for row in raw_bars
+    ]
+    if not bars:
+        return "Файл свечей пуст. Статистика не выдумана."
+    return (
+        f"Прочитано свечей: {len(bars)}, сделок ленты: {len(raw_trades)}. "
+        "Доходность не рассчитывается: запись содержит только свечи и последние сделки, "
+        "без истории bid/ask, очереди и времени funding. Стакан из close свечи не создаётся. "
+        "Нужна синхронная запись стакана, ленты, закрытых свечей и funding для полноценного replay."
+    )
+
+
 def format_saved_report(cfg: Settings) -> str:
     path = Path("data/last_report.txt")
-    if path.exists():
+    if cfg.mode == "offline" and path.exists():
         return path.read_text(encoding="utf-8")
-    store = StateStore(cfg.state_db)
-    trades = store.trades()
-    store.close()
-    submitted = 0
-    filled = sum(1 for trade in trades if trade.qty > 0)
+    if not Path(cfg.state_db).exists():
+        return "Журнал выбранного режима пока не создан. Синтетический offline-отчёт вместо него не показывается."
+    store = StateStore(cfg.state_db, readonly=True)
+    try:
+        trades = store.trades()
+        submitted = int(store.get_kv("submitted", "0"))
+        filled = int(store.get_kv("filled_entries", "0"))
+        funding = store.sum_cashflow("funding", 0, 10**15)
+        funding_events = store.cashflow_events("funding")
+        synced = store.get_kv("cashflow_synced_ms", "не подтверждено")
+    finally:
+        store.close()
     report = summarize(
         trades,
         submitted,
         filled,
-        "журнал sqlite",
+        "журнал sqlite: " + cfg.mode,
         True,
-        ["Нет data/last_report.txt. Показаны только уже записанные сделки. Доля исполнений отсюда неизвестна."],
+        [
+            "Profit factor, ожидание и просадка ниже относятся только к закрытым сделкам.",
+            "Отдельная кривая добавляет уже записанный funding. Открытый PnL в неё не входит.",
+            "Это учёт, а не доказательство положительного ожидания.",
+        ],
     )
-    return format_report(report)
+    curve_net, curve_dd = curve_drawdown([(trade.ts, trade.pnl) for trade in trades] + funding_events)
+    return (
+        format_report(report).replace("Чистый PnL:", "Торговый PnL без funding:", 1)
+        + f"\nУчтённый funding: {funding}"
+        + f"\nСумма торгового PnL и funding: {report.net_pnl + funding}"
+        + f"\nКривая сделок и funding, итог: {curve_net}"
+        + f"\nМакс. просадка кривой сделок и funding: {curve_dd}"
+        + f"\nПоследняя синхронизация журнала, Unix ms: {synced}"
+    )
